@@ -250,12 +250,14 @@ func (c *Connection) handleRegister(msg *protocol.Message) {
 	// Generate token and salt for the user
 	token, err := crypto.GenerateUserToken()
 	if err != nil {
+		logging.ErrorWithError("Failed to generate user token for registration", err, map[string]string{"username": req.Username})
 		c.sendError(500, "Failed to generate user token")
 		return
 	}
 
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
+		logging.ErrorWithError("Failed to generate salt for registration", err, map[string]string{"username": req.Username})
 		c.sendError(500, "Failed to generate salt")
 		return
 	}
@@ -267,6 +269,7 @@ func (c *Connection) handleRegister(msg *protocol.Message) {
 	}
 
 	if err := c.server.database.CreateUser(user); err != nil {
+		logging.ErrorWithError("Failed to create user in database", err, map[string]string{"username": req.Username})
 		c.sendError(409, fmt.Sprintf("Registration failed: %v", err))
 		return
 	}

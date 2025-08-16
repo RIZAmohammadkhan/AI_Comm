@@ -142,13 +142,13 @@ func (d *Database) CreateUser(user *User) error {
 			return fmt.Errorf("user %s already exists", user.Username)
 		}
 		if err != badger.ErrKeyNotFound {
-			return err
+			return fmt.Errorf("failed to check if user exists: %w", err)
 		}
 
 		// Store user data using efficient marshaling
 		userData, err := d.marshalJSON(user)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to marshal user data: %w", err)
 		}
 
 		return txn.Set(key, userData)
@@ -163,19 +163,25 @@ func (d *Database) GetUser(username string) (*User, error) {
 		key := []byte("user:" + username)
 		item, err := txn.Get(key)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to get user item: %w", err)
 		}
 
 		return item.Value(func(val []byte) error {
-			return json.Unmarshal(val, &user)
+			if err := json.Unmarshal(val, &user); err != nil {
+				return fmt.Errorf("failed to unmarshal user data: %w", err)
+			}
+			return nil
 		})
 	})
 
 	if err == badger.ErrKeyNotFound {
 		return nil, fmt.Errorf("user %s not found", username)
 	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve user %s: %w", username, err)
+	}
 
-	return &user, err
+	return &user, nil
 }
 
 // UpdateLastSeen updates the last seen timestamp for a user

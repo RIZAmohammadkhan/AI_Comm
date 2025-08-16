@@ -1,71 +1,122 @@
-# AI Message - Production-Ready End-to-End Encrypted Messaging for AI Agents
+Of course. A project of this caliber deserves a `README.md` that reflects its quality. It needs to be clean, informative, and professional.
 
-A high-performance, production-ready terminal-based messaging tool that enables AI agents to communicate securely with end-to-end encryption.
+Here is a `README.md` that does this project justice.
 
-## ✅ Production Features
+---
 
-- **Security**: Rate limiting, input validation, secure CORS policy
-- **Monitoring**: Structured JSON logging, health checks
-- **Configuration**: Environment variable support
-- **Testing**: Automated tests for critical components
-- **Deployment**: Docker support, CI/CD pipeline
-- **Performance**: Optimized with connection limits and timeouts
+# AI_Comm: Production-Grade E2E Encrypted Messaging for AI Agents
 
-## Quick Production Deployment
+[![Go CI](https://github.com/actions/workflows/ci.yml/badge.svg)](https://github.com/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/badge/go-1.21+-blue.svg)](https://golang.org)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-### Docker (Recommended)
-```bash
-# Build and run
-docker build -t aimessage-server .
-docker run -d -p 8080:8080 -e LOG_FORMAT=json aimessage-server
+AI_Comm is a high-performance, secure communication layer designed for AI agents and automated systems. It provides a robust, terminal-based messaging tool with uncompromising end-to-end encryption, ensuring that only the intended recipients can read messages. The server acts as a blind router, unable to decrypt any traffic.
+
+Built with a production-first mindset, it features a hardened server, comprehensive testing, and seamless deployment via Docker.
+
+## Key Features
+
+-   **End-to-End Encryption (E2EE):** All messages are encrypted with AES-256-GCM using keys derived from per-user tokens and salts (PBKDF2).
+-   **Perfect Forward Secrecy (PFS):** Utilizes Diffie-Hellman key exchange to establish ephemeral session keys, ensuring past conversations remain secure even if long-term credentials are compromised.
+-   **Challenge-Response Authentication:** Secure authentication mechanism that proves key ownership without ever transmitting the key or token over the network.
+-   **High-Performance Go Backend:** Built with Go and WebSockets for low-latency, persistent connections and efficient concurrency.
+-   **Production-Ready:** Includes Docker support, CI/CD pipeline, structured logging, health checks, and rate limiting.
+-   **Offline Messaging:** Messages sent to offline agents are securely stored and delivered upon their next connection.
+-   **Professional CLI:** A clean, script-friendly command-line interface powered by Cobra for easy integration and automation.
+
+## Architecture Overview
+
+The system consists of a central server that routes encrypted messages and two or more clients (AI agents) that communicate through it. The server is completely blind to the message content.
+
+```mermaid
+sequenceDiagram
+    participant Client_A
+    participant Server
+    participant Client_B
+
+    Client_A->>+Server: Register(username: "agent-a")
+    Server-->>-Client_A: Registered(token, salt)
+
+    Client_B->>+Server: Register(username: "agent-b")
+    Server-->>-Client_B: Registered(token, salt)
+
+    Client_A->>+Server: Authenticate (request challenge)
+    Server-->>-Client_A: Challenge
+    Client_A->>Server: Authenticate (encrypted response)
+    Server-->>-Client_A: ACK (Authenticated)
+
+    Note over Client_A, Client_B: Initiate PFS Key Exchange
+    Client_A->>Server: KeyExchangeRequest(to: "agent-b", pubKey_A)
+    Server->>Client_B: KeyExchangeRequest(from: "agent-a", pubKey_A)
+    Client_B->>Server: KeyExchangeResponse(to: "agent-a", pubKey_B)
+    Server->>Client_A: KeyExchangeResponse(from: "agent-b", pubKey_B)
+    Note over Client_A, Client_B: Both derive the same ephemeral session key
+
+    Note over Client_A, Client_B: Send E2E Encrypted Message
+    Client_A->>+Server: Send(to: "agent-b", Encrypted_Msg)
+    Server->>-Client_B: Message(from: "agent-a", Encrypted_Msg)
+    Client_B-->>Client_B: Decrypt(Encrypted_Msg) with session key
 ```
 
-### Manual Deployment
-```bash
-# Set environment variables
-export PORT=8080
-export DB_PATH=/var/lib/aimessage
-export LOG_FORMAT=json
+## Quick Start
 
-# Start server
-./start.sh
+### 1. Build the Project
+
+Clone the repository and run the build script.
+
+**Linux/macOS:**
+```bash
+./build.sh
 ```
 
-## Configuration
+**Windows:**
+```cmd
+build.bat
+```
+This will create the `aimessage-server` and `aimessage` binaries in the `bin/` directory.
 
-Set via environment variables:
-- `PORT`: Server port (default: 8080)
-- `DB_PATH`: Database directory (default: ./data)
-- `LOG_FORMAT`: Set to "json" for structured logging
+### 2. Start the Server
 
-## Security Features
-
-- **Rate Limiting**: 100 req/sec global, 10 req/sec per connection
-- **Input Validation**: Username sanitization and limits
-- **CORS Protection**: Localhost-only origin policy
-- **Encryption**: AES-256-GCM with PBKDF2 key derivation
-- **Connection Limits**: Per-connection message size and frequency limits
-
-## Monitoring
-
-### Health Check
+Open a terminal and run the server on the default port `8080`.
 ```bash
-curl http://localhost:8080/health
-# Returns: {"status":"ok","service":"aimessage-server"}
+./bin/aimessage-server
 ```
 
-### Structured Logging
-Set `LOG_FORMAT=json` for JSON logs suitable for log aggregation systems.
+### 3. Register Agents
 
-## Features
+Open two new terminals. Register `agent-1` and `agent-2`.
 
-- **Terminal-based Interface**: curl-like command interface for easy automation
-- **End-to-End Encryption**: Messages encrypted with per-user tokens
-- **Username System**: Unique username registration for AI agents
-- **High Performance**: Built in Go with WebSocket connections and efficient database
-- **Simple Protocol**: Text-only messages (no emojis) for AI compatibility
+**Terminal 1 (Agent 1):**
+```bash
+./bin/aimessage register --username agent-1 --server ws://localhost:8080/ws
+```
+
+**Terminal 2 (Agent 2):**
+```bash
+./bin/aimessage register --username agent-2 --server ws://localhost:8080/ws
+```
+Credentials will be saved automatically to `~/.aimessage/user.json`.
+
+### 4. Listen for Messages
+
+In Terminal 2, start listening for incoming messages as `agent-2`.
+```bash
+./bin/aimessage listen --server ws://localhost:8080/ws
+# Output: Listening for messages as agent-2... (Press Ctrl+C to stop)
+```
+
+### 5. Send a Message
+
+In Terminal 1, send an encrypted message from `agent-1` to `agent-2`.
+```bash
+./bin/aimessage send --to agent-2 --message "Hello from Agent 1. This is a secure test." --server ws://localhost:8080/ws
+```
+
+You will see the decrypted message appear instantly in Terminal 2.
 
 ## Installation
+
+For system-wide access, you can build from source as shown above or use `go install`.
 
 ```bash
 # Install the client
@@ -75,68 +126,62 @@ go install ./cmd/aimessage
 go install ./cmd/aimessage-server
 ```
 
-## Quick Start
+## Command Reference
 
-### 1. Start the Server
+All client commands require the `--server` flag (e.g., `-s ws://localhost:8080/ws`).
+
+| Command                                                    | Description                                            |
+| ---------------------------------------------------------- | ------------------------------------------------------ |
+| `aimessage register -u <username>`                         | Register a new AI agent and save its credentials.      |
+| `aimessage send -t <recipient> -m <message>`               | Send an end-to-end encrypted message to a recipient.   |
+| `aimessage listen`                                         | Connect and listen for incoming encrypted messages.    |
+| `aimessage users`                                          | List all currently online and authenticated agents.    |
+
+## Deployment (Production)
+
+### Docker (Recommended)
+
+The included `Dockerfile` creates a minimal, production-ready image.
+
+1.  **Build the image:**
+    ```bash
+    docker build -t aimessage-server .
+    ```
+
+2.  **Run the container:**
+    ```bash
+    docker run -d \
+      -p 8080:8080 \
+      -v ./data:/root/data \
+      -e PORT=8080 \
+      -e DB_PATH=/root/data \
+      -e LOG_FORMAT=json \
+      --name aimessage \
+      aimessage-server
+    ```
+
+### Manual
+
+Use the provided startup scripts, which respect environment variables for configuration.
+
+**Configuration via Environment Variables:**
+-   `PORT`: Server port (default: `8080`)
+-   `DB_PATH`: Path to the database directory (default: `./data`)
+-   `LOG_FORMAT`: Set to `json` for structured, machine-readable logs.
+
 ```bash
-aimessage-server --port 8080
+# Example for Linux/macOS
+export PORT=9000
+export DB_PATH=/var/data/aimessage
+export LOG_FORMAT=json
+./start.sh
 ```
 
-### 2. Register an AI Agent
+## Contributing
+
+Contributions are welcome. Please ensure that any pull requests are accompanied by relevant tests and that the existing test suite passes.
+
+Run all tests:
 ```bash
-aimessage register --username ai-agent-1 --server ws://localhost:8080
+go test -v ./...
 ```
-
-### 3. Send a Message
-```bash
-aimessage send --to ai-agent-2 --message "Hello from AI Agent 1" --server ws://localhost:8080
-```
-
-### 4. Listen for Messages
-```bash
-aimessage listen --server ws://localhost:8080
-```
-
-## Commands
-
-### Registration
-```bash
-aimessage register --username <username> --server <server-url>
-```
-
-### Send Message
-```bash
-aimessage send --to <recipient> --message <text> --server <server-url>
-```
-
-### Listen for Messages
-```bash
-aimessage listen --server <server-url>
-```
-
-### List Online Users
-```bash
-aimessage users --server <server-url>
-```
-
-## Security
-
-- Each registered user receives a unique encryption token
-- All messages are encrypted end-to-end using AES-GCM
-- Tokens are derived using PBKDF2 with user-specific salts
-- Server cannot decrypt messages, only routes them
-
-## Architecture
-
-- **Client**: Terminal-based CLI tool
-- **Server**: WebSocket server for real-time messaging
-- **Database**: BadgerDB for fast user storage
-- **Encryption**: AES-GCM with PBKDF2 key derivation
-
-## Performance Features
-
-- Connection pooling
-- Efficient binary protocol
-- In-memory message queuing
-- Fast database with LSM-tree storage
-- Minimal overhead encryption

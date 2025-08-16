@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"aimessage/internal/crypto"
+	"aimessage/internal/logging"
 	"aimessage/internal/protocol"
 
 	"github.com/google/uuid"
@@ -26,11 +27,12 @@ type Client struct {
 	userCrypto         *crypto.UserCrypto
 	isListening        bool
 	authenticated      bool
-	sessionKeys        map[string]*crypto.SessionKeys // Map of sessionID to session keys
-	recipientSessions  map[string]string              // Map of recipient to current sessionID
-	pendingKeyExchange map[string]*crypto.DHKeyPair   // Map of sessionID to our DH key pair (for pending exchanges)
-	readBuffer         []byte                         // Reusable read buffer
-	writeBuffer        []byte                         // Reusable write buffer
+	sessionKeys        map[string]*crypto.SessionKeys      // Map of sessionID to session keys
+	recipientSessions  map[string]string                   // Map of recipient to current sessionID
+	pendingKeyExchange map[string]*crypto.DHKeyPair        // Map of sessionID to our DH key pair (for pending exchanges)
+	keyExchangeWaiters map[string]chan *crypto.SessionKeys // Map of sessionID to completion channels
+	readBuffer         []byte                              // Reusable read buffer
+	writeBuffer        []byte                              // Reusable write buffer
 }
 
 // UserConfig stores user credentials locally
@@ -52,6 +54,7 @@ func NewClient(serverURL string) *Client {
 		sessionKeys:        make(map[string]*crypto.SessionKeys),
 		recipientSessions:  make(map[string]string),
 		pendingKeyExchange: make(map[string]*crypto.DHKeyPair),
+		keyExchangeWaiters: make(map[string]chan *crypto.SessionKeys),
 		readBuffer:         make([]byte, 0, 512), // Pre-allocate read buffer
 		writeBuffer:        make([]byte, 0, 512), // Pre-allocate write buffer
 	}
@@ -183,25 +186,25 @@ func (c *Client) getOrCreateSession(recipient string) (string, *crypto.SessionKe
 	// No existing session, initiate key exchange
 	sessionID, err := c.initiateKeyExchange(recipient)
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("failed to initiate key exchange: %w", err)
 	}
+
+	// Create a channel to wait for the key exchange completion
+	waiterChan := make(chan *crypto.SessionKeys, 1)
+	c.keyExchangeWaiters[sessionID] = waiterChan
 
 	// Wait for key exchange response (with timeout)
 	timeout := time.After(30 * time.Second)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
 
-	for {
-		select {
-		case <-timeout:
-			delete(c.pendingKeyExchange, sessionID)
-			return "", nil, fmt.Errorf("key exchange timeout")
-		case <-ticker.C:
-			if sessionKeys, exists := c.sessionKeys[sessionID]; exists {
-				c.recipientSessions[recipient] = sessionID
-				return sessionID, sessionKeys, nil
-			}
-		}
+	select {
+	case <-timeout:
+		delete(c.pendingKeyExchange, sessionID)
+		delete(c.keyExchangeWaiters, sessionID)
+		return "", nil, fmt.Errorf("key exchange timeout for session %s", sessionID)
+	case sessionKeys := <-waiterChan:
+		delete(c.keyExchangeWaiters, sessionID)
+		c.recipientSessions[recipient] = sessionID
+		return sessionID, sessionKeys, nil
 	}
 }
 
@@ -225,7 +228,7 @@ func (c *Client) SendMessage(to, message string) error {
 	sessionID, sessionKeys, err := c.getOrCreateSession(to)
 	if err != nil {
 		// Fall back to static encryption if PFS fails
-		log.Printf("PFS failed, falling back to static encryption: %v", err)
+		logging.WarnWithError("PFS failed, falling back to static encryption", err, map[string]string{"recipient": to})
 		return c.sendMessageFallback(to, message)
 	}
 
@@ -459,7 +462,7 @@ func (c *Client) Listen() error {
 		response, err := c.readMessage()
 		if err != nil {
 			if c.isListening {
-				log.Printf("Error reading message: %v", err)
+				logging.ErrorWithError("Error reading message during listen", err)
 				time.Sleep(time.Second)
 				continue
 			}
@@ -631,7 +634,7 @@ func (c *Client) handleKeyExchangeRequest(response *protocol.Message) {
 func (c *Client) handleKeyExchangeResponse(response *protocol.Message) {
 	var keyResp protocol.KeyExchangeResponse
 	if err := response.ParseData(&keyResp); err != nil {
-		log.Printf("Failed to parse key exchange response: %v", err)
+		logging.ErrorWithError("Failed to parse key exchange response", err, map[string]string{"from": keyResp.From})
 		return
 	}
 
@@ -640,7 +643,7 @@ func (c *Client) handleKeyExchangeResponse(response *protocol.Message) {
 	// 1. Check if we have a pending key exchange for this session
 	ourKeyPair, exists := c.pendingKeyExchange[keyResp.SessionID]
 	if !exists {
-		log.Printf("No pending key exchange found for session %s", keyResp.SessionID)
+		logging.Warn("No pending key exchange found", map[string]string{"session_id": keyResp.SessionID})
 		return
 	}
 
@@ -679,7 +682,17 @@ func (c *Client) handleKeyExchangeResponse(response *protocol.Message) {
 	c.sessionKeys[keyResp.SessionID] = sessionKeys
 	c.recipientSessions[keyResp.From] = keyResp.SessionID
 
-	// 6. Clean up pending exchange
+	// 6. Signal any waiting goroutines
+	if waiterChan, exists := c.keyExchangeWaiters[keyResp.SessionID]; exists {
+		select {
+		case waiterChan <- sessionKeys:
+			// Successfully signaled the waiter
+		default:
+			// Channel is full or closed, just continue
+		}
+	}
+
+	// 7. Clean up pending exchange
 	delete(c.pendingKeyExchange, keyResp.SessionID)
 
 	fmt.Printf("Key exchange completed with %s (session: %s)\n", keyResp.From, keyResp.SessionID)
