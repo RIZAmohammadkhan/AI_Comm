@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -49,7 +50,8 @@ type AuthChallenge struct {
 // Database wraps BadgerDB for user management
 type Database struct {
 	db         *badger.DB
-	jsonBuffer []byte // Reusable buffer for JSON operations
+	jsonBuffer []byte     // Reusable buffer for JSON operations
+	bufferMu   sync.Mutex // Protects jsonBuffer access
 }
 
 // NewDatabase creates a new database instance
@@ -105,6 +107,9 @@ func (d *Database) RunGarbageCollection() error {
 
 // marshalJSON efficiently marshals data using reusable buffer
 func (d *Database) marshalJSON(v interface{}) ([]byte, error) {
+	d.bufferMu.Lock()
+	defer d.bufferMu.Unlock()
+
 	d.jsonBuffer = d.jsonBuffer[:0] // Reset buffer
 
 	// Try to marshal into our buffer first
@@ -126,7 +131,10 @@ func (d *Database) marshalJSON(v interface{}) ([]byte, error) {
 		d.jsonBuffer = data[:0:cap(data)]
 	}
 
-	return data, nil
+	// Return a copy to avoid sharing memory with the reusable buffer
+	result := make([]byte, len(data))
+	copy(result, data)
+	return result, nil
 }
 
 // CreateUser creates a new user in the database

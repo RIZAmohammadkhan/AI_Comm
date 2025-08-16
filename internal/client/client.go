@@ -223,7 +223,12 @@ func (c *Client) SendMessage(to, message string) error {
 	if err := c.Connect(); err != nil {
 		return err
 	}
-	defer c.Disconnect()
+	defer func() {
+		if err := c.Disconnect(); err != nil {
+			// Log disconnect error but don't override main error
+			fmt.Printf("Warning: failed to disconnect: %v\n", err)
+		}
+	}()
 
 	// Authenticate first
 	if err := c.authenticate(); err != nil {
