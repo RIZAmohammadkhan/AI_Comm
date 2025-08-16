@@ -648,6 +648,9 @@ func TestConcurrentConnections(t *testing.T) {
 
 	numConnections := 10
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errors []string
+
 	wg.Add(numConnections)
 
 	for i := 0; i < numConnections; i++ {
@@ -656,7 +659,9 @@ func TestConcurrentConnections(t *testing.T) {
 
 			conn, err := suite.ConnectWebSocket()
 			if err != nil {
-				t.Errorf("Failed to connect: %v", err)
+				mu.Lock()
+				errors = append(errors, fmt.Sprintf("Failed to connect: %v", err))
+				mu.Unlock()
 				return
 			}
 			defer conn.Close()
@@ -668,18 +673,29 @@ func TestConcurrentConnections(t *testing.T) {
 
 			response, err := suite.SendMessage(conn, registerMsg)
 			if err != nil {
-				t.Errorf("Failed to register user %s: %v", username, err)
+				mu.Lock()
+				errors = append(errors, fmt.Sprintf("Failed to register user %s: %v", username, err))
+				mu.Unlock()
 				return
 			}
 
 			if response.Type != protocol.MsgTypeRegistered {
-				t.Errorf("Expected registered response for user %s, got %s", username, response.Type)
+				mu.Lock()
+				errors = append(errors, fmt.Sprintf("Expected registered response for user %s, got %s", username, response.Type))
+				mu.Unlock()
 				return
 			}
 		}(i)
 	}
 
 	wg.Wait()
+
+	// Check for any errors after all goroutines complete
+	if len(errors) > 0 {
+		for _, errMsg := range errors {
+			t.Error(errMsg)
+		}
+	}
 }
 
 // TestRateLimiting tests basic rate limiting functionality

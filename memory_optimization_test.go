@@ -64,8 +64,19 @@ func TestMemoryEfficiency(t *testing.T) {
 	runtime.ReadMemStats(&m3)
 
 	// Test that memory usage is reasonable
-	memoryIncrease := m2.Alloc - m1.Alloc
-	memoryAfterGC := m3.Alloc - m1.Alloc
+	var memoryIncrease, memoryAfterGC int64
+
+	if m2.Alloc >= m1.Alloc {
+		memoryIncrease = int64(m2.Alloc - m1.Alloc)
+	} else {
+		memoryIncrease = 0 // Memory decreased
+	}
+
+	if m3.Alloc >= m1.Alloc {
+		memoryAfterGC = int64(m3.Alloc - m1.Alloc)
+	} else {
+		memoryAfterGC = 0 // Memory decreased after GC
+	}
 
 	t.Logf("Initial memory: %d bytes", m1.Alloc)
 	t.Logf("Memory after operations: %d bytes", m2.Alloc)

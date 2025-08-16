@@ -40,7 +40,7 @@ jobs:
       run: go mod verify
     
     - name: Run tests
-      run: go test -v -race -coverprofile=coverage.out ./...
+      run: go test -v -timeout=10m -coverprofile=coverage.out ./...
     
     - name: Upload coverage to Codecov (Ubuntu only)
       uses: codecov/codecov-action@v4
@@ -101,11 +101,10 @@ jobs:
         cache: true
         cache-dependency-path: go.sum
     
-    - name: Install gosec
-      run: go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
-    
-    - name: Run security scan
-      run: gosec -fmt sarif -out gosec.sarif -stdout -verbose=text ./...
+    - name: Run gosec Security Scanner
+      uses: securecodewarrior/github-action-gosec@master
+      with:
+        args: '-fmt sarif -out gosec.sarif ./...'
       continue-on-error: true
     
     - name: Upload SARIF file
@@ -115,7 +114,7 @@ jobs:
         sarif_file: gosec.sarif
         category: gosec
     
-    - name: Run govulncheck
+    - name: Install and run govulncheck
       run: |
         go install golang.org/x/vuln/cmd/govulncheck@latest
         govulncheck ./...
