@@ -39,8 +39,13 @@ jobs:
     - name: Verify dependencies
       run: go mod verify
     
-    - name: Run tests
+    - name: Run tests (Linux/macOS)
+      if: matrix.os != 'windows-latest'
       run: go test -v -race -timeout=10m -coverprofile=coverage.out ./...
+    
+    - name: Run tests (Windows)
+      if: matrix.os == 'windows-latest'
+      run: go test -v -race -timeout=10m "-coverprofile=coverage.out" ./...
     
     - name: Upload coverage to Codecov (Ubuntu only)
       uses: codecov/codecov-action@v4
