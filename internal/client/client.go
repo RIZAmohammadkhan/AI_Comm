@@ -27,17 +27,16 @@ type Client struct {
 	configDir          string
 	username           string
 	userCrypto         *crypto.UserCrypto
-	isListening        int32                               // atomic flag
-	authenticated      int32                               // atomic flag for thread safety
-	sessionKeys        map[string]*crypto.SessionKeys      // Protected by mu
-	recipientSessions  map[string]string                   // Protected by mu
-	pendingKeyExchange map[string]*crypto.DHKeyPair        // Protected by mu
-	keyExchangeWaiters map[string]chan *crypto.SessionKeys // Protected by mu
-	readBuffer         []byte                              // Reusable read buffer
-	writeBuffer        []byte                              // Reusable write buffer
-	mu                 sync.RWMutex                        // Protects maps above
-	writeMu            sync.Mutex                          // Protects WebSocket writes
-	closeOnce          sync.Once                           // Ensures cleanup happens only once
+	isListening        int32                          // atomic flag
+	authenticated      int32                          // atomic flag for thread safety
+	sessionKeys        map[string]*crypto.SessionKeys // Protected by mu
+	recipientSessions  map[string]string              // Protected by mu
+	pendingKeyExchange map[string]*crypto.DHKeyPair   // Protected by mu
+	readBuffer         []byte                         // Reusable read buffer
+	writeBuffer        []byte                         // Reusable write buffer
+	mu                 sync.RWMutex                   // Protects maps above
+	writeMu            sync.Mutex                     // Protects WebSocket writes
+	closeOnce          sync.Once                      // Ensures cleanup happens only once
 }
 
 // UserConfig stores user credentials locally
@@ -73,7 +72,6 @@ func NewClientWithConfigDir(serverURL, configDir string) *Client {
 		sessionKeys:        make(map[string]*crypto.SessionKeys),
 		recipientSessions:  make(map[string]string),
 		pendingKeyExchange: make(map[string]*crypto.DHKeyPair),
-		keyExchangeWaiters: make(map[string]chan *crypto.SessionKeys),
 		readBuffer:         make([]byte, 0, 512), // Pre-allocate read buffer
 		writeBuffer:        make([]byte, 0, 512), // Pre-allocate write buffer
 	}
@@ -83,12 +81,6 @@ func NewClientWithConfigDir(serverURL, configDir string) *Client {
 func (c *Client) cleanupKeyExchange(sessionID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	// Close waiter channel if exists
-	if waiterChan, exists := c.keyExchangeWaiters[sessionID]; exists {
-		close(waiterChan)
-		delete(c.keyExchangeWaiters, sessionID)
-	}
 
 	// Clean up pending exchange
 	delete(c.pendingKeyExchange, sessionID)
@@ -101,13 +93,8 @@ func (c *Client) safeCleanup() {
 		atomic.StoreInt32(&c.isListening, 0)
 		atomic.StoreInt32(&c.authenticated, 0)
 
-		// Clean up all key exchange waiters
-		c.mu.Lock()
-		for sessionID, waiterChan := range c.keyExchangeWaiters {
-			close(waiterChan)
-			delete(c.keyExchangeWaiters, sessionID)
-		}
 		// Clear all maps
+		c.mu.Lock()
 		clear(c.pendingKeyExchange)
 		clear(c.sessionKeys)
 		clear(c.recipientSessions)
@@ -245,6 +232,116 @@ func (c *Client) initiateKeyExchange(recipient string) (string, error) {
 	return sessionID, nil
 }
 
+// waitForKeyExchangeResponse waits for a key exchange response by reading messages directly
+func (c *Client) waitForKeyExchangeResponse(sessionID string, timeout time.Duration) (*crypto.SessionKeys, error) {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		// Set a read timeout to avoid blocking forever
+		if err := c.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			return nil, fmt.Errorf("failed to set read deadline: %w", err)
+		}
+
+		response, err := c.readMessage()
+		if err != nil {
+			// Check if this is a timeout error and we still have time left
+			if time.Now().Before(deadline) {
+				continue // Keep trying
+			}
+			return nil, fmt.Errorf("timeout waiting for key exchange response: %w", err)
+		}
+
+		// Reset read deadline
+		c.conn.SetReadDeadline(time.Time{})
+
+		// Handle different message types
+		switch response.Type {
+		case protocol.MsgTypeKeyResponse:
+			// This is our key exchange response!
+			sessionKeys, err := c.processKeyExchangeResponse(response, sessionID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to process key exchange response: %w", err)
+			}
+			if sessionKeys != nil {
+				return sessionKeys, nil
+			}
+			// If sessionKeys is nil, this response wasn't for our session, continue waiting
+
+		case protocol.MsgTypeKeyRequest:
+			// Handle incoming key exchange requests while waiting
+			c.handleKeyExchangeRequest(response)
+
+		case protocol.MsgTypeMessage, protocol.MsgTypeOfflineMsg:
+			// Handle other messages while waiting (store them for later or process immediately)
+			c.handleIncomingMessage(response)
+
+		case protocol.MsgTypeError:
+			return nil, fmt.Errorf("received error message while waiting for key exchange")
+
+			// Ignore other message types while waiting
+		}
+	}
+
+	return nil, fmt.Errorf("timeout waiting for key exchange response for session %s", sessionID)
+}
+
+// processKeyExchangeResponse processes a key exchange response and returns session keys if it matches our session
+func (c *Client) processKeyExchangeResponse(response *protocol.Message, expectedSessionID string) (*crypto.SessionKeys, error) {
+	var keyResp protocol.KeyExchangeResponse
+	if err := response.ParseData(&keyResp); err != nil {
+		return nil, fmt.Errorf("failed to parse key exchange response: %w", err)
+	}
+
+	// Check if this response is for our expected session (if we have one)
+	if expectedSessionID != "" && keyResp.SessionID != expectedSessionID {
+		// This is for a different session, ignore it
+		return nil, nil
+	}
+
+	fmt.Printf("Received key exchange response from %s for session %s\n", keyResp.From, keyResp.SessionID)
+
+	// Get our key pair for this session
+	c.mu.Lock()
+	ourKeyPair, exists := c.pendingKeyExchange[keyResp.SessionID]
+	c.mu.Unlock()
+
+	if !exists {
+		// If we're in listen mode and don't have a pending exchange, this might be valid
+		// but we can't process it, so just log and ignore
+		if expectedSessionID == "" {
+			log.Printf("No pending key exchange found for session %s (listen mode)", keyResp.SessionID)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("no pending key exchange found for session %s", keyResp.SessionID)
+	}
+
+	// Decode their public key
+	theirPublicKey, err := base64.StdEncoding.DecodeString(keyResp.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode their public key: %w", err)
+	}
+
+	// Compute shared secret
+	sharedSecret, err := crypto.ComputeSharedSecret(ourKeyPair.PrivateKey, theirPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute shared secret: %w", err)
+	}
+
+	// Derive session keys
+	salt, err := crypto.GenerateSalt()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate salt: %w", err)
+	}
+
+	sessionKeys, err := crypto.DeriveSessionKeys(sharedSecret, keyResp.SessionID, salt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive session keys: %w", err)
+	}
+
+	fmt.Printf("Key exchange completed with %s (session: %s)\n", keyResp.From, keyResp.SessionID)
+	return sessionKeys, nil
+}
+
 // getOrCreateSession gets an existing session or creates a new one via key exchange
 func (c *Client) getOrCreateSession(recipient string) (string, *crypto.SessionKeys, error) {
 	// Check if we have an existing session
@@ -264,26 +361,21 @@ func (c *Client) getOrCreateSession(recipient string) (string, *crypto.SessionKe
 		return "", nil, fmt.Errorf("failed to initiate key exchange: %w", err)
 	}
 
-	// Create a channel to wait for the key exchange completion
-	waiterChan := make(chan *crypto.SessionKeys, 1)
+	// Wait for key exchange response by directly reading messages
+	sessionKeys, err := c.waitForKeyExchangeResponse(sessionID, 30*time.Second)
+	if err != nil {
+		c.cleanupKeyExchange(sessionID)
+		return "", nil, fmt.Errorf("key exchange failed: %w", err)
+	}
+
+	// Store the session
 	c.mu.Lock()
-	c.keyExchangeWaiters[sessionID] = waiterChan
+	c.sessionKeys[sessionID] = sessionKeys
+	c.recipientSessions[recipient] = sessionID
+	delete(c.pendingKeyExchange, sessionID)
 	c.mu.Unlock()
 
-	// Wait for key exchange response (with timeout)
-	timeout := time.After(30 * time.Second)
-
-	select {
-	case <-timeout:
-		c.cleanupKeyExchange(sessionID)
-		return "", nil, fmt.Errorf("key exchange timeout for session %s", sessionID)
-	case sessionKeys := <-waiterChan:
-		c.mu.Lock()
-		delete(c.keyExchangeWaiters, sessionID)
-		c.recipientSessions[recipient] = sessionID
-		c.mu.Unlock()
-		return sessionID, sessionKeys, nil
-	}
+	return sessionID, sessionKeys, nil
 }
 
 // SendMessage sends an encrypted message to another user with Perfect Forward Secrecy
@@ -656,13 +748,14 @@ func (c *Client) handleOfflineMessage(response *protocol.Message) {
 
 // handleKeyExchangeRequest handles incoming key exchange requests for PFS
 func (c *Client) handleKeyExchangeRequest(response *protocol.Message) {
-	var keyReq protocol.KeyExchangeRequest
-	if err := response.ParseData(&keyReq); err != nil {
+	var keyForward protocol.KeyExchangeForward // Use the new struct
+	if err := response.ParseData(&keyForward); err != nil {
 		log.Printf("Failed to parse key exchange request: %v", err)
 		return
 	}
 
-	fmt.Printf("Received key exchange request from %s for session %s\n", keyReq.To, keyReq.SessionID)
+	// The log message is now correct and clearer
+	fmt.Printf("Received key exchange request from %s for session %s\n", keyForward.From, keyForward.SessionID)
 
 	// 1. Generate our DH key pair
 	keyPair, err := crypto.GenerateDHKeyPair()
@@ -672,7 +765,7 @@ func (c *Client) handleKeyExchangeRequest(response *protocol.Message) {
 	}
 
 	// 2. Decode their public key
-	theirPublicKey, err := base64.StdEncoding.DecodeString(keyReq.PublicKey)
+	theirPublicKey, err := base64.StdEncoding.DecodeString(keyForward.PublicKey)
 	if err != nil {
 		log.Printf("Failed to decode their public key: %v", err)
 		return
@@ -692,7 +785,7 @@ func (c *Client) handleKeyExchangeRequest(response *protocol.Message) {
 		return
 	}
 
-	sessionKeys, err := crypto.DeriveSessionKeys(sharedSecret, keyReq.SessionID, salt)
+	sessionKeys, err := crypto.DeriveSessionKeys(sharedSecret, keyForward.SessionID, salt)
 	if err != nil {
 		log.Printf("Failed to derive session keys: %v", err)
 		return
@@ -700,17 +793,17 @@ func (c *Client) handleKeyExchangeRequest(response *protocol.Message) {
 
 	// 5. Store session keys (with proper locking)
 	c.mu.Lock()
-	c.sessionKeys[keyReq.SessionID] = sessionKeys
-	// Note: keyReq.To is actually the sender (initiator)
-	c.recipientSessions[keyReq.To] = keyReq.SessionID
+	c.sessionKeys[keyForward.SessionID] = sessionKeys
+	// Note: keyForward.From is the sender (initiator)
+	c.recipientSessions[keyForward.From] = keyForward.SessionID
 	c.mu.Unlock()
 
 	// 6. Send our public key back
 	publicKeyB64 := base64.StdEncoding.EncodeToString(keyPair.PublicKey)
 	keyResp := protocol.KeyExchangeResponse{
-		From:      c.username,
+		From:      c.username, // This is correct, we are the one responding
 		PublicKey: publicKeyB64,
-		SessionID: keyReq.SessionID,
+		SessionID: keyForward.SessionID,
 	}
 
 	msg := protocol.NewMessage(protocol.MsgTypeKeyResponse, keyResp)
@@ -720,86 +813,41 @@ func (c *Client) handleKeyExchangeRequest(response *protocol.Message) {
 		log.Printf("Failed to send key exchange response: %v", err)
 		// Clean up on failure
 		c.mu.Lock()
-		delete(c.sessionKeys, keyReq.SessionID)
-		delete(c.recipientSessions, keyReq.To)
+		delete(c.sessionKeys, keyForward.SessionID)
+		delete(c.recipientSessions, keyForward.From)
 		c.mu.Unlock()
 		return
 	}
 
-	fmt.Printf("Key exchange completed with %s (session: %s)\n", keyReq.To, keyReq.SessionID)
+	fmt.Printf("Key exchange completed with %s (session: %s)\n", keyForward.From, keyForward.SessionID)
 }
 
-// handleKeyExchangeResponse handles key exchange responses
+// handleKeyExchangeResponse handles key exchange responses (for clients in Listen mode)
 func (c *Client) handleKeyExchangeResponse(response *protocol.Message) {
-	var keyResp protocol.KeyExchangeResponse
-	if err := response.ParseData(&keyResp); err != nil {
-		logging.ErrorWithError("Failed to parse key exchange response", err, map[string]string{"from": keyResp.From})
-		return
-	}
+	// For clients in Listen mode, we still need to handle key exchange responses
+	// that might come for different sessions or when not actively waiting
 
-	fmt.Printf("Received key exchange response from %s for session %s\n", keyResp.From, keyResp.SessionID)
-
-	// 1. Check if we have a pending key exchange for this session
-	c.mu.Lock()
-	ourKeyPair, exists := c.pendingKeyExchange[keyResp.SessionID]
-	if !exists {
-		c.mu.Unlock()
-		logging.Warn("No pending key exchange found", map[string]string{"session_id": keyResp.SessionID})
-		return
-	}
-	c.mu.Unlock()
-
-	// 2. Decode their public key
-	theirPublicKey, err := base64.StdEncoding.DecodeString(keyResp.PublicKey)
+	sessionKeys, err := c.processKeyExchangeResponse(response, "")
 	if err != nil {
-		log.Printf("Failed to decode their public key: %v", err)
-		c.cleanupKeyExchange(keyResp.SessionID)
+		log.Printf("Failed to process key exchange response in listen mode: %v", err)
 		return
 	}
 
-	// 3. Compute shared secret
-	sharedSecret, err := crypto.ComputeSharedSecret(ourKeyPair.PrivateKey, theirPublicKey)
-	if err != nil {
-		log.Printf("Failed to compute shared secret: %v", err)
-		c.cleanupKeyExchange(keyResp.SessionID)
-		return
-	}
-
-	// 4. Derive session keys
-	salt, err := crypto.GenerateSalt()
-	if err != nil {
-		log.Printf("Failed to generate salt: %v", err)
-		c.cleanupKeyExchange(keyResp.SessionID)
-		return
-	}
-
-	sessionKeys, err := crypto.DeriveSessionKeys(sharedSecret, keyResp.SessionID, salt)
-	if err != nil {
-		log.Printf("Failed to derive session keys: %v", err)
-		c.cleanupKeyExchange(keyResp.SessionID)
-		return
-	}
-
-	// 5. Store session keys and signal waiting goroutines
-	c.mu.Lock()
-	c.sessionKeys[keyResp.SessionID] = sessionKeys
-	c.recipientSessions[keyResp.From] = keyResp.SessionID
-
-	// 6. Signal any waiting goroutines
-	if waiterChan, exists := c.keyExchangeWaiters[keyResp.SessionID]; exists {
-		select {
-		case waiterChan <- sessionKeys:
-			// Successfully signaled the waiter
-		default:
-			// Channel is full or closed, just continue
+	if sessionKeys != nil {
+		// Extract session ID from the response
+		var keyResp protocol.KeyExchangeResponse
+		if err := response.ParseData(&keyResp); err != nil {
+			log.Printf("Failed to parse key exchange response: %v", err)
+			return
 		}
+
+		// Store the session keys
+		c.mu.Lock()
+		c.sessionKeys[keyResp.SessionID] = sessionKeys
+		c.recipientSessions[keyResp.From] = keyResp.SessionID
+		delete(c.pendingKeyExchange, keyResp.SessionID)
+		c.mu.Unlock()
 	}
-
-	// 7. Clean up pending exchange
-	delete(c.pendingKeyExchange, keyResp.SessionID)
-	c.mu.Unlock()
-
-	fmt.Printf("Key exchange completed with %s (session: %s)\n", keyResp.From, keyResp.SessionID)
 }
 
 // ListUsers gets the list of online users
@@ -882,6 +930,11 @@ func (c *Client) heartbeat() {
 
 // sendMessage sends a message over WebSocket with proper synchronization
 func (c *Client) sendMessage(msg *protocol.Message) error {
+	// Add debug logging for key exchange related messages
+	if msg.Type == protocol.MsgTypeKeyExchange || msg.Type == protocol.MsgTypeKeyResponse {
+		fmt.Printf("[CLIENT %s] Sending %s\n", c.username, msg.Type)
+	}
+
 	msgBytes, err := msg.Marshal()
 	if err != nil {
 		return err

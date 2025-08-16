@@ -145,6 +145,15 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if this is a proper WebSocket upgrade request
+	if r.Header.Get("Upgrade") != "websocket" {
+		// This is not a WebSocket request, return a proper HTTP response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"This endpoint only accepts WebSocket connections","hint":"Use ws:// or wss:// protocol"}`))
+		return
+	}
+
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logging.Error("WebSocket upgrade failed", map[string]string{"error": err.Error()})
@@ -249,6 +258,12 @@ func (c *Connection) writePump() {
 
 // handleMessage processes incoming messages based on type
 func (c *Connection) handleMessage(msg *protocol.Message) {
+	// Add debug logging for key exchange related messages
+	if msg.Type == protocol.MsgTypeKeyExchange || msg.Type == protocol.MsgTypeKeyResponse {
+		username := c.getUsername()
+		fmt.Printf("[SERVER] Received %s from %s\n", msg.Type, username)
+	}
+
 	switch msg.Type {
 	case protocol.MsgTypeRegister:
 		c.handleRegister(msg)
@@ -258,6 +273,8 @@ func (c *Connection) handleMessage(msg *protocol.Message) {
 		c.handleSend(msg)
 	case protocol.MsgTypeKeyExchange:
 		c.handleKeyExchange(msg)
+	case protocol.MsgTypeKeyResponse:
+		c.handleKeyResponse(msg)
 	case protocol.MsgTypeListen:
 		c.handleListen(msg)
 	case protocol.MsgTypeListUsers:
@@ -525,9 +542,9 @@ func (c *Connection) handleKeyExchange(msg *protocol.Message) {
 		return
 	}
 
-	// Forward key exchange request
-	keyRequest := protocol.KeyExchangeRequest{
-		To:        username, // This should be the initiator's username
+	// Forward key exchange request using the new, clear struct
+	keyForward := protocol.KeyExchangeForward{
+		From:      username, // Explicitly state who it's from
 		PublicKey: req.PublicKey,
 		SessionID: req.SessionID,
 	}
@@ -546,8 +563,98 @@ func (c *Connection) handleKeyExchange(msg *protocol.Message) {
 		return
 	}
 
-	targetConn.sendMessage(protocol.MsgTypeKeyRequest, keyRequest)
+	// Send using MsgTypeKeyRequest, but with the new payload
+	targetConn.sendMessage(protocol.MsgTypeKeyRequest, keyForward)
 	c.sendMessage(protocol.MsgTypeAck, map[string]string{"status": "key_exchange_initiated"})
+}
+
+// handleKeyResponse forwards the key exchange response to the original initiator
+func (c *Connection) handleKeyResponse(msg *protocol.Message) {
+	if !c.isAuthenticated() {
+		c.sendError(401, "Not authenticated")
+		return
+	}
+
+	var keyResp protocol.KeyExchangeResponse
+	if err := msg.ParseData(&keyResp); err != nil {
+		c.sendError(400, "Invalid key response data")
+		return
+	}
+
+	logging.Info("Received key exchange response", map[string]string{
+		"from":       keyResp.From,
+		"session_id": keyResp.SessionID,
+	})
+
+	// The `From` field is the user who is responding (the original recipient).
+	// We need to find the session to know who the original initiator was.
+	session, err := c.server.database.GetSession(keyResp.SessionID)
+	if err != nil {
+		logging.Error("Session not found for key exchange", map[string]string{
+			"session_id": keyResp.SessionID,
+			"error":      err.Error(),
+		})
+		c.sendError(404, "Session not found for key exchange")
+		return
+	}
+
+	logging.Info("Found session for key exchange", map[string]string{
+		"session_id":   keyResp.SessionID,
+		"participants": fmt.Sprintf("%v", session.Participants),
+	})
+
+	// Find the original initiator in the session participants
+	var initiatorUsername string
+	for _, p := range session.Participants {
+		if p != keyResp.From {
+			initiatorUsername = p
+			break
+		}
+	}
+
+	if initiatorUsername == "" {
+		logging.Error("Could not identify key exchange initiator", map[string]string{
+			"session_id":   keyResp.SessionID,
+			"responder":    keyResp.From,
+			"participants": fmt.Sprintf("%v", session.Participants),
+		})
+		c.sendError(500, "Could not identify key exchange initiator")
+		return
+	}
+
+	logging.Info("Identified key exchange initiator", map[string]string{
+		"initiator":  initiatorUsername,
+		"responder":  keyResp.From,
+		"session_id": keyResp.SessionID,
+	})
+
+	// Find the initiator's connection
+	value, exists := c.server.connections.Load(initiatorUsername)
+	if !exists {
+		logging.Info("Key exchange initiator is offline, response dropped", map[string]string{"initiator": initiatorUsername, "session_id": keyResp.SessionID})
+		return
+	}
+
+	initiatorConn, ok := value.(*Connection)
+	if !ok {
+		c.sendError(500, "Invalid connection state for initiator")
+		return
+	}
+
+	logging.Info("Forwarding key exchange response to initiator", map[string]string{
+		"initiator":  initiatorUsername,
+		"responder":  keyResp.From,
+		"session_id": keyResp.SessionID,
+	})
+
+	// Forward the response to the initiator
+	initiatorConn.sendMessage(protocol.MsgTypeKeyResponse, keyResp)
+
+	logging.Info("Key exchange response forwarded successfully", map[string]string{
+		"initiator":  initiatorUsername,
+		"responder":  keyResp.From,
+		"session_id": keyResp.SessionID,
+	})
 }
 
 // deliverOfflineMessages delivers any stored offline messages to the user

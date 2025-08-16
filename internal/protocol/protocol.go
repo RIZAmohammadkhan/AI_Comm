@@ -128,6 +128,13 @@ type KeyExchangeRequest struct {
 	SessionID string `json:"session_id" mapstructure:"session_id"`
 }
 
+// KeyExchangeForward is sent from the server to the recipient to initiate a key exchange
+type KeyExchangeForward struct {
+	From      string `json:"from" mapstructure:"from"`
+	PublicKey string `json:"public_key" mapstructure:"public_key"` // Base64 encoded DH public key
+	SessionID string `json:"session_id" mapstructure:"session_id"`
+}
+
 // KeyExchangeResponse responds to DH key exchange
 type KeyExchangeResponse struct {
 	From      string `json:"from" mapstructure:"from"`
