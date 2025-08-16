@@ -1,0 +1,24 @@
+# Build executables
+bin/
+*.exe
+
+# Go build cache
+.go
+
+# Database files
+data/
+*.db
+
+# User configuration
+.aimessage/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
