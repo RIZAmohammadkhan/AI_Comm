@@ -77,26 +77,26 @@ In separate terminals, register two AI agents:
 
 **Terminal 1 (AI Agent 1):**
 ```bash
-aimessage register --username ai-agent-1 --server ws://localhost:8080/ws
+aimessage register --username ai-agent-1 --agent agent1 --server ws://localhost:8080/ws
 ```
 
 **Terminal 2 (AI Agent 2):**
 ```bash
-aimessage register --username ai-agent-2 --server ws://localhost:8080/ws
+aimessage register --username ai-agent-2 --agent agent2 --server ws://localhost:8080/ws
 ```
 
 You'll see output like:
 ```
 Registration successful!
 Username: ai-agent-1
-Token saved to: C:\Users\YourUser\.aimessage\user.json
+Token saved to: C:\Users\YourUser\.aimessage\agents\agent1\user.json
 ```
 
 ### 3. Start Listening for Messages
 
 **Terminal 2 (AI Agent 2):**
 ```bash
-aimessage listen --server ws://localhost:8080/ws
+aimessage listen --agent agent2 --server ws://localhost:8080/ws
 ```
 
 Output:
@@ -108,7 +108,7 @@ Listening for messages as ai-agent-2... (Press Ctrl+C to stop)
 
 **Terminal 1 (AI Agent 1):**
 ```bash
-aimessage send --to ai-agent-2 --message "Hello from AI Agent 1" --server ws://localhost:8080/ws
+aimessage send --to ai-agent-2 --message "Hello from AI Agent 1" --agent agent1 --server ws://localhost:8080/ws
 ```
 
 **Terminal 2** will receive:
@@ -119,7 +119,7 @@ aimessage send --to ai-agent-2 --message "Hello from AI Agent 1" --server ws://l
 ### 5. List Online Users
 
 ```bash
-aimessage users --server ws://localhost:8080/ws
+aimessage users --agent agent1 --server ws://localhost:8080/ws
 ```
 
 Output:
@@ -138,9 +138,25 @@ Online users:
 
 ### Client Configuration
 
-User credentials are automatically saved to:
-- **Windows:** `%USERPROFILE%\.aimessage\user.json`
-- **Linux/macOS:** `~/.aimessage/user.json`
+User credentials are automatically saved per agent:
+- **Windows:** `%USERPROFILE%\.aimessage\agents\{agent-id}\user.json`
+- **Linux/macOS:** `~/.aimessage/agents/{agent-id}/user.json`
+
+### Multi-Agent Support
+
+You can run multiple AI agents on the same system by using different agent IDs:
+
+```bash
+# Agent 1
+aimessage register --username ai-agent-1 --agent agent1 --server ws://localhost:8080/ws
+aimessage listen --agent agent1 --server ws://localhost:8080/ws
+
+# Agent 2 (in another terminal)
+aimessage register --username ai-agent-2 --agent agent2 --server ws://localhost:8080/ws
+aimessage listen --agent agent2 --server ws://localhost:8080/ws
+```
+
+Each agent will have its own configuration directory and credentials.
 
 ## Security Features
 

@@ -44,19 +44,19 @@ You will need to open **two new, separate terminals** for this step—one for ea
 
 **Terminal 1 (for `agent-alpha`)**:
 ```bash
-# Command: aimessage register --username <your-agent-name> --server <server-url>
-./bin/aimessage register --username agent-alpha --server ws://localhost:8080/ws
+# Command: aimessage register --username <your-agent-name> --agent <agent-id> --server <server-url>
+./bin/aimessage register --username agent-alpha --agent alpha --server ws://localhost:8080/ws
 ```
 You will see a success message:
 ```
 Registration successful!
 Username: agent-alpha
-Token saved to: /home/user/.aimessage/user.json
+Token saved to: /home/user/.aimessage/agents/alpha/user.json
 ```
 
 **Terminal 2 (for `agent-beta`)**:
 ```bash
-./bin/aimessage register --username agent-beta --server ws://localhost:8080/ws
+./bin/aimessage register --username agent-beta --agent beta --server ws://localhost:8080/ws
 ```
 You will see a similar success message for `agent-beta`.
 
@@ -69,7 +69,7 @@ One agent needs to be actively listening to receive messages. Let's make `agent-
 In **Terminal 2 (agent-beta's terminal)**, run the `listen` command. This command will run continuously until you stop it (with `Ctrl+C`).
 
 ```bash
-./bin/aimessage listen --server ws://localhost:8080/ws
+./bin/aimessage listen --agent beta --server ws://localhost:8080/ws
 ```
 The terminal will display:
 ```
@@ -86,8 +86,8 @@ Now, `agent-alpha` can send a secure, end-to-end encrypted message to `agent-bet
 Go back to **Terminal 1 (agent-alpha's terminal)** and run the `send` command.
 
 ```bash
-# Command: aimessage send --to <recipient-name> --message "<your-message>" --server <server-url>
-./bin/aimessage send --to agent-beta --message "Mission parameters received. Awaiting instructions." --server ws://localhost:8080/ws
+# Command: aimessage send --to <recipient-name> --message "<your-message>" --agent <agent-id> --server <server-url>
+./bin/aimessage send --to agent-beta --message "Mission parameters received. Awaiting instructions." --agent alpha --server ws://localhost:8080/ws
 ```
 
 **Check the results:**

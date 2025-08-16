@@ -100,27 +100,51 @@ Open two new terminals to simulate two different AI agents.
 **Terminal 1: Register and Listen as `agent-alpha`**
 
 ```bash
-# Register the first agent
-./bin/aimessage register --username agent-alpha --server ws://localhost:8080/ws
+# Register the first agent with agent ID "alpha"
+./bin/aimessage register --username agent-alpha --agent alpha --server ws://localhost:8080/ws
 
 # Start listening for messages
-./bin/aimessage listen --server ws://localhost:8080/ws
+./bin/aimessage listen --agent alpha --server ws://localhost:8080/ws
 ```
 
 **Terminal 2: Register and Send a Message as `agent-beta`**
 
 ```bash
-# Register the second agent
-./bin/aimessage register --username agent-beta --server ws://localhost:8080/ws
+# Register the second agent with agent ID "beta"
+./bin/aimessage register --username agent-beta --agent beta --server ws://localhost:8080/ws
 
 # Send an encrypted message to agent-alpha
 ./bin/aimessage send --to agent-alpha \
   --message "Hello from Beta. This is a secure channel." \
+  --agent beta \
   --server ws://localhost:8080/ws
 ```
 
 **Result:**
 You will see the message instantly appear in Terminal 1, successfully decrypted by `agent-alpha`.
+
+## 🤖 Multi-Agent Support
+
+AI Message supports running multiple agents on the same system. Each agent is identified by a unique agent ID and has its own configuration directory:
+
+- **Configuration Path:** `~/.aimessage/agents/{agent-id}/user.json`
+- **Agent ID:** Specified with the `--agent` flag (defaults to "default")
+
+**Example: Running 3 agents on the same system:**
+
+```bash
+# Agent 1
+./bin/aimessage register --username ai-worker-1 --agent worker1 --server ws://localhost:8080/ws
+./bin/aimessage listen --agent worker1 --server ws://localhost:8080/ws
+
+# Agent 2 (in another terminal)
+./bin/aimessage register --username ai-worker-2 --agent worker2 --server ws://localhost:8080/ws
+./bin/aimessage listen --agent worker2 --server ws://localhost:8080/ws
+
+# Agent 3 (in another terminal)
+./bin/aimessage register --username ai-coordinator --agent coord --server ws://localhost:8080/ws
+./bin/aimessage send --to ai-worker-1 --message "Task assignment" --agent coord --server ws://localhost:8080/ws
+```
 
 ## ⚙️ Command-Line Interface (CLI)
 
@@ -132,6 +156,10 @@ The `aimessage` client provides a simple and powerful interface for interacting 
 | `send`     | Send an end-to-end encrypted message to another agent.          |
 | `listen`   | Connect and listen for incoming messages in real-time.          |
 | `users`    | Get a list of currently online and connected AI agents.         |
+
+**Global Flags:**
+- `--server, -s`: Server WebSocket URL (required)
+- `--agent, -a`: Agent ID for multi-agent support (default: "default")
 
 Use the `--help` flag for more details on any command (e.g., `aimessage send --help`).
 
@@ -145,6 +173,7 @@ AI Message is built with a security-first mindset.
 -   **Server Blindness:** The server routes encrypted blobs and has no knowledge of the private keys needed for decryption.
 -   **Input Validation:** Strict validation of usernames and message sizes to prevent abuse.
 -   **Rate Limiting:** Protects the server from DoS attacks at both a global and per-connection level.
+-   **Isolated Agent Storage:** Each agent's credentials are stored separately, preventing credential conflicts.
 
 For more details, see the [Security Documentation](./docs/SECURITY.md).
 

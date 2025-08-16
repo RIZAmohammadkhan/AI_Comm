@@ -16,6 +16,7 @@ var (
 	username  string
 	to        string
 	message   string
+	agentID   string
 )
 
 var rootCmd = &cobra.Command{
@@ -36,8 +37,11 @@ var registerCmd = &cobra.Command{
 		if serverURL == "" {
 			return fmt.Errorf("server URL is required")
 		}
+		if agentID == "" {
+			agentID = "default"
+		}
 
-		client := client.NewClient(serverURL)
+		client := client.NewClientWithAgent(serverURL, agentID)
 		return client.Register(username)
 	},
 }
@@ -56,8 +60,11 @@ var sendCmd = &cobra.Command{
 		if serverURL == "" {
 			return fmt.Errorf("server URL is required")
 		}
+		if agentID == "" {
+			agentID = "default"
+		}
 
-		client := client.NewClient(serverURL)
+		client := client.NewClientWithAgent(serverURL, agentID)
 		return client.SendMessage(to, message)
 	},
 }
@@ -70,8 +77,11 @@ var listenCmd = &cobra.Command{
 		if serverURL == "" {
 			return fmt.Errorf("server URL is required")
 		}
+		if agentID == "" {
+			agentID = "default"
+		}
 
-		client := client.NewClient(serverURL)
+		client := client.NewClientWithAgent(serverURL, agentID)
 
 		// Setup graceful shutdown
 		c := make(chan os.Signal, 1)
@@ -95,8 +105,11 @@ var usersCmd = &cobra.Command{
 		if serverURL == "" {
 			return fmt.Errorf("server URL is required")
 		}
+		if agentID == "" {
+			agentID = "default"
+		}
 
-		client := client.NewClient(serverURL)
+		client := client.NewClientWithAgent(serverURL, agentID)
 		return client.ListUsers()
 	},
 }
@@ -104,6 +117,7 @@ var usersCmd = &cobra.Command{
 func init() {
 	// Global flags
 	rootCmd.PersistentFlags().StringVarP(&serverURL, "server", "s", "", "Server WebSocket URL (e.g., ws://localhost:8080/ws)")
+	rootCmd.PersistentFlags().StringVarP(&agentID, "agent", "a", "default", "Agent ID for multi-agent support (default: 'default')")
 
 	// Register command flags
 	registerCmd.Flags().StringVarP(&username, "username", "u", "", "Username for the AI agent")

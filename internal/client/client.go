@@ -47,10 +47,17 @@ type UserConfig struct {
 	Salt     string `json:"salt"`
 }
 
-// NewClient creates a new client instance
+// NewClient creates a new client instance with default agent ID
 func NewClient(serverURL string) *Client {
+	return NewClientWithAgent(serverURL, "default")
+}
+
+// NewClientWithAgent creates a new client instance for a specific agent
+// This enables multiple agents to run on the same system with separate configurations.
+// Each agent's credentials are stored in ~/.aimessage/agents/{agentID}/user.json
+func NewClientWithAgent(serverURL, agentID string) *Client {
 	homeDir, _ := os.UserHomeDir()
-	configDir := filepath.Join(homeDir, ".aimessage")
+	configDir := filepath.Join(homeDir, ".aimessage", "agents", agentID)
 	return NewClientWithConfigDir(serverURL, configDir)
 }
 
