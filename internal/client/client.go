@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"aimessage/internal/crypto"
@@ -25,14 +27,16 @@ type Client struct {
 	configDir          string
 	username           string
 	userCrypto         *crypto.UserCrypto
-	isListening        bool
+	isListening        int32 // atomic flag
 	authenticated      bool
-	sessionKeys        map[string]*crypto.SessionKeys      // Map of sessionID to session keys
-	recipientSessions  map[string]string                   // Map of recipient to current sessionID
-	pendingKeyExchange map[string]*crypto.DHKeyPair        // Map of sessionID to our DH key pair (for pending exchanges)
-	keyExchangeWaiters map[string]chan *crypto.SessionKeys // Map of sessionID to completion channels
+	sessionKeys        map[string]*crypto.SessionKeys      // Protected by mu
+	recipientSessions  map[string]string                   // Protected by mu
+	pendingKeyExchange map[string]*crypto.DHKeyPair        // Protected by mu
+	keyExchangeWaiters map[string]chan *crypto.SessionKeys // Protected by mu
 	readBuffer         []byte                              // Reusable read buffer
 	writeBuffer        []byte                              // Reusable write buffer
+	mu                 sync.RWMutex                        // Protects maps above
+	writeMu            sync.Mutex                          // Protects WebSocket writes
 }
 
 // UserConfig stores user credentials locally
@@ -159,7 +163,9 @@ func (c *Client) initiateKeyExchange(recipient string) (string, error) {
 	}
 
 	// Store our key pair for when we receive the response
+	c.mu.Lock()
 	c.pendingKeyExchange[sessionID] = keyPair
+	c.mu.Unlock()
 
 	// Send key exchange request
 	publicKeyB64 := base64.StdEncoding.EncodeToString(keyPair.PublicKey)
@@ -173,7 +179,9 @@ func (c *Client) initiateKeyExchange(recipient string) (string, error) {
 	msg.ID = uuid.New().String()
 
 	if err := c.sendMessage(msg); err != nil {
+		c.mu.Lock()
 		delete(c.pendingKeyExchange, sessionID)
+		c.mu.Unlock()
 		return "", fmt.Errorf("failed to send key exchange request: %w", err)
 	}
 
@@ -183,11 +191,15 @@ func (c *Client) initiateKeyExchange(recipient string) (string, error) {
 // getOrCreateSession gets an existing session or creates a new one via key exchange
 func (c *Client) getOrCreateSession(recipient string) (string, *crypto.SessionKeys, error) {
 	// Check if we have an existing session
-	if sessionID, exists := c.recipientSessions[recipient]; exists {
+	c.mu.RLock()
+	sessionID, exists := c.recipientSessions[recipient]
+	if exists {
 		if sessionKeys, exists := c.sessionKeys[sessionID]; exists {
+			c.mu.RUnlock()
 			return sessionID, sessionKeys, nil
 		}
 	}
+	c.mu.RUnlock()
 
 	// No existing session, initiate key exchange
 	sessionID, err := c.initiateKeyExchange(recipient)
@@ -197,19 +209,25 @@ func (c *Client) getOrCreateSession(recipient string) (string, *crypto.SessionKe
 
 	// Create a channel to wait for the key exchange completion
 	waiterChan := make(chan *crypto.SessionKeys, 1)
+	c.mu.Lock()
 	c.keyExchangeWaiters[sessionID] = waiterChan
+	c.mu.Unlock()
 
 	// Wait for key exchange response (with timeout)
 	timeout := time.After(30 * time.Second)
 
 	select {
 	case <-timeout:
+		c.mu.Lock()
 		delete(c.pendingKeyExchange, sessionID)
 		delete(c.keyExchangeWaiters, sessionID)
+		c.mu.Unlock()
 		return "", nil, fmt.Errorf("key exchange timeout for session %s", sessionID)
 	case sessionKeys := <-waiterChan:
+		c.mu.Lock()
 		delete(c.keyExchangeWaiters, sessionID)
 		c.recipientSessions[recipient] = sessionID
+		c.mu.Unlock()
 		return sessionID, sessionKeys, nil
 	}
 }
@@ -467,16 +485,16 @@ func (c *Client) Listen() error {
 	}
 
 	fmt.Printf("Listening for messages as %s... (Press Ctrl+C to stop)\n", c.username)
-	c.isListening = true
+	atomic.StoreInt32(&c.isListening, 1)
 
 	// Start heartbeat goroutine
 	go c.heartbeat()
 
 	// Listen for messages
-	for c.isListening {
+	for atomic.LoadInt32(&c.isListening) == 1 {
 		response, err := c.readMessage()
 		if err != nil {
-			if c.isListening {
+			if atomic.LoadInt32(&c.isListening) == 1 {
 				logging.ErrorWithError("Error reading message during listen", err)
 				time.Sleep(time.Second)
 				continue
@@ -505,7 +523,11 @@ func (c *Client) handleIncomingMessage(response *protocol.Message) {
 	var offlineMsg protocol.OfflineMessage
 	if err := response.ParseData(&offlineMsg); err == nil && offlineMsg.SessionID != "" {
 		// This is a message with session info, try to decrypt with session keys
-		if sessionKeys, exists := c.sessionKeys[offlineMsg.SessionID]; exists {
+		c.mu.RLock()
+		sessionKeys, exists := c.sessionKeys[offlineMsg.SessionID]
+		c.mu.RUnlock()
+
+		if exists {
 			sessionCrypto := crypto.NewSessionCrypto(sessionKeys)
 			decryptedMessage, err := sessionCrypto.Decrypt(offlineMsg.Message)
 			if err != nil {
@@ -553,7 +575,11 @@ func (c *Client) handleOfflineMessage(response *protocol.Message) {
 
 	if offline.SessionID != "" {
 		// Use session key if available
-		if sessionKeys, exists := c.sessionKeys[offline.SessionID]; exists {
+		c.mu.RLock()
+		sessionKeys, exists := c.sessionKeys[offline.SessionID]
+		c.mu.RUnlock()
+
+		if exists {
 			sessionCrypto := crypto.NewSessionCrypto(sessionKeys)
 			decryptedMessage, err = sessionCrypto.Decrypt(offline.Message)
 		} else {
@@ -619,9 +645,11 @@ func (c *Client) handleKeyExchangeRequest(response *protocol.Message) {
 	}
 
 	// 5. Store session keys
+	c.mu.Lock()
 	c.sessionKeys[keyReq.SessionID] = sessionKeys
 	// Note: keyReq.To is actually the sender (initiator)
 	c.recipientSessions[keyReq.To] = keyReq.SessionID
+	c.mu.Unlock()
 
 	// 6. Send our public key back
 	publicKeyB64 := base64.StdEncoding.EncodeToString(keyPair.PublicKey)
@@ -637,8 +665,10 @@ func (c *Client) handleKeyExchangeRequest(response *protocol.Message) {
 	if err := c.sendMessage(msg); err != nil {
 		log.Printf("Failed to send key exchange response: %v", err)
 		// Clean up on failure
+		c.mu.Lock()
 		delete(c.sessionKeys, keyReq.SessionID)
 		delete(c.recipientSessions, keyReq.To)
+		c.mu.Unlock()
 		return
 	}
 
@@ -656,17 +686,22 @@ func (c *Client) handleKeyExchangeResponse(response *protocol.Message) {
 	fmt.Printf("Received key exchange response from %s for session %s\n", keyResp.From, keyResp.SessionID)
 
 	// 1. Check if we have a pending key exchange for this session
+	c.mu.Lock()
 	ourKeyPair, exists := c.pendingKeyExchange[keyResp.SessionID]
 	if !exists {
+		c.mu.Unlock()
 		logging.Warn("No pending key exchange found", map[string]string{"session_id": keyResp.SessionID})
 		return
 	}
+	c.mu.Unlock()
 
 	// 2. Decode their public key
 	theirPublicKey, err := base64.StdEncoding.DecodeString(keyResp.PublicKey)
 	if err != nil {
 		log.Printf("Failed to decode their public key: %v", err)
+		c.mu.Lock()
 		delete(c.pendingKeyExchange, keyResp.SessionID)
+		c.mu.Unlock()
 		return
 	}
 
@@ -674,7 +709,9 @@ func (c *Client) handleKeyExchangeResponse(response *protocol.Message) {
 	sharedSecret, err := crypto.ComputeSharedSecret(ourKeyPair.PrivateKey, theirPublicKey)
 	if err != nil {
 		log.Printf("Failed to compute shared secret: %v", err)
+		c.mu.Lock()
 		delete(c.pendingKeyExchange, keyResp.SessionID)
+		c.mu.Unlock()
 		return
 	}
 
@@ -682,18 +719,23 @@ func (c *Client) handleKeyExchangeResponse(response *protocol.Message) {
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
 		log.Printf("Failed to generate salt: %v", err)
+		c.mu.Lock()
 		delete(c.pendingKeyExchange, keyResp.SessionID)
+		c.mu.Unlock()
 		return
 	}
 
 	sessionKeys, err := crypto.DeriveSessionKeys(sharedSecret, keyResp.SessionID, salt)
 	if err != nil {
 		log.Printf("Failed to derive session keys: %v", err)
+		c.mu.Lock()
 		delete(c.pendingKeyExchange, keyResp.SessionID)
+		c.mu.Unlock()
 		return
 	}
 
-	// 5. Store session keys
+	// 5. Store session keys and signal waiting goroutines
+	c.mu.Lock()
 	c.sessionKeys[keyResp.SessionID] = sessionKeys
 	c.recipientSessions[keyResp.From] = keyResp.SessionID
 
@@ -709,6 +751,7 @@ func (c *Client) handleKeyExchangeResponse(response *protocol.Message) {
 
 	// 7. Clean up pending exchange
 	delete(c.pendingKeyExchange, keyResp.SessionID)
+	c.mu.Unlock()
 
 	fmt.Printf("Key exchange completed with %s (session: %s)\n", keyResp.From, keyResp.SessionID)
 }
@@ -778,7 +821,7 @@ func (c *Client) heartbeat() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if !c.isListening {
+		if atomic.LoadInt32(&c.isListening) == 0 {
 			return
 		}
 
@@ -791,13 +834,15 @@ func (c *Client) heartbeat() {
 	}
 }
 
-// sendMessage sends a message over WebSocket
+// sendMessage sends a message over WebSocket with proper synchronization
 func (c *Client) sendMessage(msg *protocol.Message) error {
 	msgBytes, err := msg.Marshal()
 	if err != nil {
 		return err
 	}
 
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	return c.conn.WriteMessage(websocket.TextMessage, msgBytes)
 }
 
@@ -856,5 +901,5 @@ func (c *Client) getUserConfigPath() string {
 
 // StopListening stops the listening loop
 func (c *Client) StopListening() {
-	c.isListening = false
+	atomic.StoreInt32(&c.isListening, 0)
 }

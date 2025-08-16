@@ -27,17 +27,17 @@ type Connection struct {
 	server        *Server
 	limiter       *rate.Limiter
 	authenticated bool
-	readBuffer    []byte // Reusable read buffer
+	readBuffer    []byte     // Reusable read buffer
+	mu            sync.Mutex // Protects connection state
 }
 
 // Server manages WebSocket connections and message routing
 type Server struct {
 	database    *db.Database
-	connections map[string]*Connection
+	connections sync.Map // map[string]*Connection - concurrent-safe map
 	register    chan *Connection
 	unregister  chan *Connection
 	broadcast   chan []byte
-	mutex       sync.RWMutex
 	upgrader    websocket.Upgrader
 	globalRate  *rate.Limiter
 }
@@ -50,12 +50,11 @@ func NewServer(dbPath string) (*Server, error) {
 	}
 
 	server := &Server{
-		database:    database,
-		connections: make(map[string]*Connection),
-		register:    make(chan *Connection),
-		unregister:  make(chan *Connection),
-		broadcast:   make(chan []byte),
-		globalRate:  rate.NewLimiter(rate.Limit(100), 200), // 100 req/sec, burst 200
+		database:   database,
+		register:   make(chan *Connection),
+		unregister: make(chan *Connection),
+		broadcast:  make(chan []byte),
+		globalRate: rate.NewLimiter(rate.Limit(100), 200), // 100 req/sec, burst 200
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				// Allow localhost and same-origin only for security
@@ -76,31 +75,26 @@ func (s *Server) Run() {
 	for {
 		select {
 		case conn := <-s.register:
-			s.mutex.Lock()
-			s.connections[conn.username] = conn
-			s.mutex.Unlock()
+			s.connections.Store(conn.username, conn)
 			logging.Info("User connected", map[string]string{"username": conn.username})
 
 		case conn := <-s.unregister:
-			s.mutex.Lock()
-			if _, ok := s.connections[conn.username]; ok {
-				delete(s.connections, conn.username)
+			if _, ok := s.connections.LoadAndDelete(conn.username); ok {
 				close(conn.send)
 				logging.Info("User disconnected", map[string]string{"username": conn.username})
 			}
-			s.mutex.Unlock()
 
 		case message := <-s.broadcast:
-			s.mutex.RLock()
-			for _, conn := range s.connections {
+			s.connections.Range(func(key, value interface{}) bool {
+				conn := value.(*Connection)
 				select {
 				case conn.send <- message:
 				default:
-					delete(s.connections, conn.username)
+					s.connections.Delete(key)
 					close(conn.send)
 				}
-			}
-			s.mutex.RUnlock()
+				return true
+			})
 		}
 	}
 }
@@ -304,7 +298,12 @@ func (c *Connection) handleRegister(msg *protocol.Message) {
 
 // handleSend processes message sending
 func (c *Connection) handleSend(msg *protocol.Message) {
-	if !c.authenticated {
+	c.mu.Lock()
+	isAuthenticated := c.authenticated
+	username := c.username
+	c.mu.Unlock()
+
+	if !isAuthenticated {
 		c.sendError(401, "Not authenticated")
 		return
 	}
@@ -316,15 +315,12 @@ func (c *Connection) handleSend(msg *protocol.Message) {
 	}
 
 	// Find target connection
-	c.server.mutex.RLock()
-	targetConn, exists := c.server.connections[req.To]
-	c.server.mutex.RUnlock()
-
+	value, exists := c.server.connections.Load(req.To)
 	if !exists {
 		// Store message for offline delivery
 		offlineMsg := &db.OfflineMessage{
 			MessageID: uuid.New().String(),
-			From:      c.username,
+			From:      username,
 			To:        req.To,
 			Message:   req.Message,
 			SessionID: req.SessionID,
@@ -338,15 +334,17 @@ func (c *Connection) handleSend(msg *protocol.Message) {
 		}
 
 		c.sendMessage(protocol.MsgTypeAck, map[string]string{"status": "stored_offline"})
-		if err := c.server.database.UpdateLastSeen(c.username); err != nil {
-			log.Printf("Failed to update last seen for %s: %v", c.username, err)
+		if err := c.server.database.UpdateLastSeen(username); err != nil {
+			log.Printf("Failed to update last seen for %s: %v", username, err)
 		}
 		return
 	}
 
+	targetConn := value.(*Connection)
+
 	// Create message delivery with session info
 	delivery := protocol.OfflineMessage{
-		From:      c.username,
+		From:      username,
 		Message:   req.Message,
 		SessionID: req.SessionID,
 		Timestamp: time.Now().Unix(),
@@ -357,8 +355,8 @@ func (c *Connection) handleSend(msg *protocol.Message) {
 	c.sendMessage(protocol.MsgTypeAck, map[string]string{"status": "delivered"})
 
 	// Update last seen
-	if err := c.server.database.UpdateLastSeen(c.username); err != nil {
-		log.Printf("Failed to update last seen for %s: %v", c.username, err)
+	if err := c.server.database.UpdateLastSeen(username); err != nil {
+		log.Printf("Failed to update last seen for %s: %v", username, err)
 	}
 }
 
@@ -435,8 +433,11 @@ func (c *Connection) handleAuthenticate(msg *protocol.Message) {
 	}
 
 	// Authentication successful
+	c.mu.Lock()
 	c.username = req.Username
 	c.authenticated = true
+	c.mu.Unlock()
+
 	c.server.register <- c
 
 	// Clean up challenge
@@ -452,7 +453,12 @@ func (c *Connection) handleAuthenticate(msg *protocol.Message) {
 
 // handleKeyExchange processes Diffie-Hellman key exchange for PFS
 func (c *Connection) handleKeyExchange(msg *protocol.Message) {
-	if !c.authenticated {
+	c.mu.Lock()
+	isAuthenticated := c.authenticated
+	username := c.username
+	c.mu.Unlock()
+
+	if !isAuthenticated {
 		c.sendError(401, "Not authenticated")
 		return
 	}
@@ -464,14 +470,13 @@ func (c *Connection) handleKeyExchange(msg *protocol.Message) {
 	}
 
 	// Find target connection
-	c.server.mutex.RLock()
-	targetConn, exists := c.server.connections[req.To]
-	c.server.mutex.RUnlock()
-
+	value, exists := c.server.connections.Load(req.To)
 	if !exists {
 		c.sendError(404, "User not found or offline")
 		return
 	}
+
+	targetConn := value.(*Connection)
 
 	// Forward key exchange request
 	keyRequest := protocol.KeyExchangeRequest{
@@ -483,7 +488,7 @@ func (c *Connection) handleKeyExchange(msg *protocol.Message) {
 	// Store session info
 	session := &db.Session{
 		SessionID:    req.SessionID,
-		Participants: []string{c.username, req.To},
+		Participants: []string{username, req.To},
 		CreatedAt:    time.Now(),
 		LastUsed:     time.Now(),
 		ExpiresAt:    time.Now().Add(24 * time.Hour), // Sessions expire after 24 hours
@@ -500,10 +505,14 @@ func (c *Connection) handleKeyExchange(msg *protocol.Message) {
 
 // deliverOfflineMessages delivers any stored offline messages to the user
 func (c *Connection) deliverOfflineMessages() {
-	messages, err := c.server.database.GetOfflineMessages(c.username)
+	c.mu.Lock()
+	username := c.username
+	c.mu.Unlock()
+
+	messages, err := c.server.database.GetOfflineMessages(username)
 	if err != nil {
 		logging.Error("Failed to get offline messages", map[string]string{
-			"username": c.username,
+			"username": username,
 			"error":    err.Error(),
 		})
 		return
@@ -521,9 +530,9 @@ func (c *Connection) deliverOfflineMessages() {
 		c.sendMessage(protocol.MsgTypeOfflineMsg, offlineDelivery)
 
 		// Mark as delivered
-		if err := c.server.database.MarkMessageDelivered(c.username, msg.MessageID); err != nil {
+		if err := c.server.database.MarkMessageDelivered(username, msg.MessageID); err != nil {
 			logging.Error("Failed to mark message as delivered", map[string]string{
-				"username":   c.username,
+				"username":   username,
 				"message_id": msg.MessageID,
 				"error":      err.Error(),
 			})
@@ -532,7 +541,7 @@ func (c *Connection) deliverOfflineMessages() {
 
 	if len(messages) > 0 {
 		logging.Info("Delivered offline messages", map[string]string{
-			"username": c.username,
+			"username": username,
 			"count":    fmt.Sprintf("%d", len(messages)),
 		})
 	}
@@ -540,32 +549,42 @@ func (c *Connection) deliverOfflineMessages() {
 
 // handleListen acknowledges that the client is ready to receive messages
 func (c *Connection) handleListen(msg *protocol.Message) {
-	if !c.authenticated {
+	c.mu.Lock()
+	isAuthenticated := c.authenticated
+	username := c.username
+	c.mu.Unlock()
+
+	if !isAuthenticated {
 		c.sendError(401, "Not authenticated")
 		return
 	}
 
 	c.sendMessage(protocol.MsgTypeAck, map[string]string{"status": "listening"})
-	if err := c.server.database.UpdateLastSeen(c.username); err != nil {
-		log.Printf("Failed to update last seen for %s: %v", c.username, err)
+	if err := c.server.database.UpdateLastSeen(username); err != nil {
+		log.Printf("Failed to update last seen for %s: %v", username, err)
 	}
 }
 
 // handleListUsers returns list of online users
 func (c *Connection) handleListUsers(msg *protocol.Message) {
-	if !c.authenticated {
+	c.mu.Lock()
+	isAuthenticated := c.authenticated
+	username := c.username
+	c.mu.Unlock()
+
+	if !isAuthenticated {
 		c.sendError(401, "Not authenticated")
 		return
 	}
 
-	c.server.mutex.RLock()
-	users := make([]string, 0, len(c.server.connections))
-	for username := range c.server.connections {
-		if username != c.username { // Don't include self
-			users = append(users, username)
+	var users []string
+	c.server.connections.Range(func(key, value interface{}) bool {
+		connUsername := key.(string)
+		if connUsername != username { // Don't include self
+			users = append(users, connUsername)
 		}
-	}
-	c.server.mutex.RUnlock()
+		return true
+	})
 
 	response := protocol.UserListResponse{Users: users}
 	c.sendMessage(protocol.MsgTypeUserList, response)
@@ -573,15 +592,20 @@ func (c *Connection) handleListUsers(msg *protocol.Message) {
 
 // handleHeartbeat processes heartbeat messages
 func (c *Connection) handleHeartbeat(msg *protocol.Message) {
-	if c.authenticated && c.username != "" {
-		if err := c.server.database.UpdateLastSeen(c.username); err != nil {
-			log.Printf("Failed to update last seen for %s: %v", c.username, err)
+	c.mu.Lock()
+	isAuthenticated := c.authenticated
+	username := c.username
+	c.mu.Unlock()
+
+	if isAuthenticated && username != "" {
+		if err := c.server.database.UpdateLastSeen(username); err != nil {
+			log.Printf("Failed to update last seen for %s: %v", username, err)
 		}
 	}
 	c.sendMessage(protocol.MsgTypeAck, map[string]string{"status": "ok"})
 }
 
-// sendMessage sends a message to the client
+// sendMessage sends a message to the client with protection against concurrent writes
 func (c *Connection) sendMessage(msgType protocol.MessageType, data interface{}) {
 	msg := protocol.NewMessage(msgType, data)
 	msg.ID = uuid.New().String()
