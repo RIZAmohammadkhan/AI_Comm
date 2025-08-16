@@ -3,13 +3,12 @@ package crypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/elliptic"
+	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"math/big"
 
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -55,40 +54,43 @@ func GenerateSalt() ([]byte, error) {
 
 // GenerateDHKeyPair generates a new Diffie-Hellman key pair using P-256 curve
 func GenerateDHKeyPair() (*DHKeyPair, error) {
-	curve := elliptic.P256()
-	privateKey, err := rand.Int(rand.Reader, curve.Params().N)
+	// Use the new crypto/ecdh package
+	curve := ecdh.P256()
+	privateKey, err := curve.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate private key: %w", err)
 	}
 
-	// Generate public key
-	x, y := curve.ScalarBaseMult(privateKey.Bytes())
-	publicKey := elliptic.Marshal(curve, x, y)
-
 	return &DHKeyPair{
 		PrivateKey: privateKey.Bytes(),
-		PublicKey:  publicKey,
+		PublicKey:  privateKey.PublicKey().Bytes(),
 	}, nil
 }
 
 // ComputeSharedSecret computes the shared secret from our private key and their public key
 func ComputeSharedSecret(ourPrivateKey []byte, theirPublicKey []byte) ([]byte, error) {
-	curve := elliptic.P256()
+	curve := ecdh.P256()
 
-	// Unmarshal their public key
-	x, y := elliptic.Unmarshal(curve, theirPublicKey)
-	if x == nil {
-		return nil, errors.New("invalid public key")
+	// Reconstruct our private key
+	privateKey, err := curve.NewPrivateKey(ourPrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid private key: %w", err)
 	}
 
-	// Convert our private key to big.Int
-	privateKey := new(big.Int).SetBytes(ourPrivateKey)
+	// Reconstruct their public key
+	publicKey, err := curve.NewPublicKey(theirPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid public key: %w", err)
+	}
 
 	// Compute shared secret
-	sharedX, _ := curve.ScalarMult(x, y, privateKey.Bytes())
+	sharedSecret, err := privateKey.ECDH(publicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute shared secret: %w", err)
+	}
 
 	// Use SHA256 to derive a fixed-length key from the shared secret
-	hash := sha256.Sum256(sharedX.Bytes())
+	hash := sha256.Sum256(sharedSecret)
 	return hash[:], nil
 }
 

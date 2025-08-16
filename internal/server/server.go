@@ -140,9 +140,13 @@ func (c *Connection) readPump() {
 	}()
 
 	c.ws.SetReadLimit(512) // Reduced from 1024 for memory efficiency
-	c.ws.SetReadDeadline(time.Now().Add(60 * time.Second))
+	if err := c.ws.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
+		log.Printf("Failed to set read deadline: %v", err)
+	}
 	c.ws.SetPongHandler(func(string) error {
-		c.ws.SetReadDeadline(time.Now().Add(60 * time.Second))
+		if err := c.ws.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
+			log.Printf("Failed to set read deadline in pong handler: %v", err)
+		}
 		return nil
 	})
 
@@ -183,9 +187,14 @@ func (c *Connection) writePump() {
 	for {
 		select {
 		case message, ok := <-c.send:
-			c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				log.Printf("Failed to set write deadline: %v", err)
+				return
+			}
 			if !ok {
-				c.ws.WriteMessage(websocket.CloseMessage, []byte{})
+				if err := c.ws.WriteMessage(websocket.CloseMessage, []byte{}); err != nil {
+					log.Printf("Failed to write close message: %v", err)
+				}
 				return
 			}
 
@@ -194,7 +203,10 @@ func (c *Connection) writePump() {
 			}
 
 		case <-ticker.C:
-			c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				log.Printf("Failed to set write deadline for ping: %v", err)
+				return
+			}
 			if err := c.ws.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
@@ -321,7 +333,9 @@ func (c *Connection) handleSend(msg *protocol.Message) {
 		}
 
 		c.sendMessage(protocol.MsgTypeAck, map[string]string{"status": "stored_offline"})
-		c.server.database.UpdateLastSeen(c.username)
+		if err := c.server.database.UpdateLastSeen(c.username); err != nil {
+			log.Printf("Failed to update last seen for %s: %v", c.username, err)
+		}
 		return
 	}
 
@@ -338,7 +352,9 @@ func (c *Connection) handleSend(msg *protocol.Message) {
 	c.sendMessage(protocol.MsgTypeAck, map[string]string{"status": "delivered"})
 
 	// Update last seen
-	c.server.database.UpdateLastSeen(c.username)
+	if err := c.server.database.UpdateLastSeen(c.username); err != nil {
+		log.Printf("Failed to update last seen for %s: %v", c.username, err)
+	}
 }
 
 // handleAuthenticate processes authentication with challenge-response
@@ -393,7 +409,9 @@ func (c *Connection) handleAuthenticate(msg *protocol.Message) {
 	}
 
 	if time.Now().After(storedChallenge.ExpiresAt) {
-		c.server.database.DeleteAuthChallenge(req.Username)
+		if err := c.server.database.DeleteAuthChallenge(req.Username); err != nil {
+			log.Printf("Failed to delete expired auth challenge for %s: %v", req.Username, err)
+		}
 		c.sendError(401, "Challenge expired")
 		return
 	}
@@ -417,7 +435,9 @@ func (c *Connection) handleAuthenticate(msg *protocol.Message) {
 	c.server.register <- c
 
 	// Clean up challenge
-	c.server.database.DeleteAuthChallenge(req.Username)
+	if err := c.server.database.DeleteAuthChallenge(req.Username); err != nil {
+		log.Printf("Failed to delete auth challenge for %s: %v", req.Username, err)
+	}
 
 	// Send offline messages if any
 	c.deliverOfflineMessages()
@@ -521,7 +541,9 @@ func (c *Connection) handleListen(msg *protocol.Message) {
 	}
 
 	c.sendMessage(protocol.MsgTypeAck, map[string]string{"status": "listening"})
-	c.server.database.UpdateLastSeen(c.username)
+	if err := c.server.database.UpdateLastSeen(c.username); err != nil {
+		log.Printf("Failed to update last seen for %s: %v", c.username, err)
+	}
 }
 
 // handleListUsers returns list of online users
@@ -547,7 +569,9 @@ func (c *Connection) handleListUsers(msg *protocol.Message) {
 // handleHeartbeat processes heartbeat messages
 func (c *Connection) handleHeartbeat(msg *protocol.Message) {
 	if c.authenticated && c.username != "" {
-		c.server.database.UpdateLastSeen(c.username)
+		if err := c.server.database.UpdateLastSeen(c.username); err != nil {
+			log.Printf("Failed to update last seen for %s: %v", c.username, err)
+		}
 	}
 	c.sendMessage(protocol.MsgTypeAck, map[string]string{"status": "ok"})
 }

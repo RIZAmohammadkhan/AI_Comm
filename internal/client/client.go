@@ -46,7 +46,9 @@ type UserConfig struct {
 func NewClient(serverURL string) *Client {
 	homeDir, _ := os.UserHomeDir()
 	configDir := filepath.Join(homeDir, ".aimessage")
-	os.MkdirAll(configDir, 0700)
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		log.Printf("Warning: failed to create config directory: %v", err)
+	}
 
 	return &Client{
 		serverURL:          serverURL,
@@ -89,7 +91,11 @@ func (c *Client) Register(username string) error {
 	if err := c.Connect(); err != nil {
 		return err
 	}
-	defer c.Disconnect()
+	defer func() {
+		if err := c.Disconnect(); err != nil {
+			fmt.Printf("Warning: failed to disconnect: %v\n", err)
+		}
+	}()
 
 	// Send registration request
 	req := protocol.RegisterRequest{Username: username}
@@ -436,7 +442,11 @@ func (c *Client) Listen() error {
 	if err := c.Connect(); err != nil {
 		return err
 	}
-	defer c.Disconnect()
+	defer func() {
+		if err := c.Disconnect(); err != nil {
+			fmt.Printf("Warning: failed to disconnect: %v\n", err)
+		}
+	}()
 
 	// Authenticate first
 	if err := c.authenticate(); err != nil {
@@ -707,7 +717,11 @@ func (c *Client) ListUsers() error {
 	if err := c.Connect(); err != nil {
 		return err
 	}
-	defer c.Disconnect()
+	defer func() {
+		if err := c.Disconnect(); err != nil {
+			fmt.Printf("Warning: failed to disconnect: %v\n", err)
+		}
+	}()
 
 	// Authenticate first
 	if err := c.authenticate(); err != nil {

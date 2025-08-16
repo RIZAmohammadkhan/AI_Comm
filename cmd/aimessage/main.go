@@ -107,13 +107,19 @@ func init() {
 
 	// Register command flags
 	registerCmd.Flags().StringVarP(&username, "username", "u", "", "Username for the AI agent")
-	registerCmd.MarkFlagRequired("username")
+	if err := registerCmd.MarkFlagRequired("username"); err != nil {
+		panic(fmt.Sprintf("Failed to mark username flag as required: %v", err))
+	}
 
 	// Send command flags
 	sendCmd.Flags().StringVarP(&to, "to", "t", "", "Recipient username")
 	sendCmd.Flags().StringVarP(&message, "message", "m", "", "Message to send")
-	sendCmd.MarkFlagRequired("to")
-	sendCmd.MarkFlagRequired("message")
+	if err := sendCmd.MarkFlagRequired("to"); err != nil {
+		panic(fmt.Sprintf("Failed to mark to flag as required: %v", err))
+	}
+	if err := sendCmd.MarkFlagRequired("message"); err != nil {
+		panic(fmt.Sprintf("Failed to mark message flag as required: %v", err))
+	}
 
 	// Add commands to root
 	rootCmd.AddCommand(registerCmd)
