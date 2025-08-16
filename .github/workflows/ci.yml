@@ -6,9 +6,22 @@ on:
   pull_request:
     branches: [ main ]
 
+env:
+  GO_VERSION: '1.21'
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            goos: linux
+          - os: windows-latest
+            goos: windows
+          - os: macos-latest
+            goos: darwin
     
     steps:
     - uses: actions/checkout@v4
@@ -16,21 +29,43 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.21'
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
+        cache-dependency-path: go.sum
     
     - name: Download dependencies
       run: go mod download
     
-    - name: Run tests
-      run: go test -v ./...
+    - name: Verify dependencies
+      run: go mod verify
     
-    - name: Build server
+    - name: Run tests
+      run: go test -v -race -coverprofile=coverage.out ./...
+    
+    - name: Upload coverage to Codecov (Ubuntu only)
+      uses: codecov/codecov-action@v4
+      if: matrix.os == 'ubuntu-latest' && always()
+      with:
+        file: ./coverage.out
+        fail_ci_if_error: false
+    
+    - name: Build server (Linux/macOS)
+      if: matrix.os != 'windows-latest'
       run: go build -o bin/aimessage-server ./cmd/aimessage-server
     
-    - name: Build client
+    - name: Build client (Linux/macOS)
+      if: matrix.os != 'windows-latest'
       run: go build -o bin/aimessage ./cmd/aimessage
+    
+    - name: Build server (Windows)
+      if: matrix.os == 'windows-latest'
+      run: go build -o bin/aimessage-server.exe ./cmd/aimessage-server
+    
+    - name: Build client (Windows)
+      if: matrix.os == 'windows-latest'
+      run: go build -o bin/aimessage.exe ./cmd/aimessage
 
-  security:
+  lint:
     runs-on: ubuntu-latest
     
     steps:
@@ -39,9 +74,48 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.21'
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
+        cache-dependency-path: go.sum
+    
+    - name: Run golangci-lint
+      uses: golangci/golangci-lint-action@v4
+      with:
+        version: latest
+        args: --timeout=5m
+
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
+        cache-dependency-path: go.sum
+    
+    - name: Install gosec
+      run: go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
     
     - name: Run security scan
-      uses: securecodewarrior/github-action-gosec@master
+      run: gosec -fmt sarif -out gosec.sarif -stdout -verbose=text ./...
+      continue-on-error: true
+    
+    - name: Upload SARIF file
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
       with:
-        args: './...'
+        sarif_file: gosec.sarif
+        category: gosec
+    
+    - name: Run govulncheck
+      run: |
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+        govulncheck ./...
