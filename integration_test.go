@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"aimessage/internal/client"
 	"aimessage/internal/crypto"
@@ -39,8 +40,15 @@ func SetupTestSuite(t *testing.T) *TestSuite {
 	// Use in-memory temporary directory when possible
 	tempDir := t.TempDir() // Go 1.15+ provides automatic cleanup
 
-	tempDBPath := filepath.Join(tempDir, "test_db")
-	tempConfigPath := filepath.Join(tempDir, "test_config")
+	// Add test name and timestamp to ensure uniqueness
+	testName := strings.ReplaceAll(t.Name(), "/", "_")
+	timestamp := fmt.Sprintf("%d", time.Now().UnixNano())
+	tempDBPath := filepath.Join(tempDir, fmt.Sprintf("test_db_%s_%s", testName, timestamp))
+	tempConfigPath := filepath.Join(tempDir, fmt.Sprintf("test_config_%s_%s", testName, timestamp))
+
+	// Ensure directory exists
+	err := os.MkdirAll(filepath.Dir(tempDBPath), 0755)
+	require.NoError(t, err)
 
 	// Create server with memory-optimized database
 	srv, err := server.NewServer(tempDBPath)
@@ -74,6 +82,8 @@ func SetupTestSuite(t *testing.T) *TestSuite {
 	// Cleanup function
 	t.Cleanup(func() {
 		suite.Cleanup()
+		// Give a small grace period for cleanup to complete
+		time.Sleep(10 * time.Millisecond)
 	})
 
 	return suite
@@ -87,14 +97,15 @@ func (ts *TestSuite) Cleanup() {
 	// Close all WebSocket connections efficiently
 	for _, conn := range ts.connections {
 		if conn != nil {
-			conn.Close()
+			// Close gracefully without logging errors for test cleanup
+			_ = conn.Close()
 		}
 	}
 	ts.connections = ts.connections[:0] // Reset slice but keep capacity
 
 	// Close server database to free resources immediately
 	if ts.server != nil {
-		ts.server.Close()
+		_ = ts.server.Close()
 	}
 
 	// Close HTTP server

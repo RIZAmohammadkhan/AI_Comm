@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -188,13 +189,12 @@ func (c *Connection) writePump() {
 		select {
 		case message, ok := <-c.send:
 			if err := c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-				log.Printf("Failed to set write deadline: %v", err)
+				// Connection might already be closed, just return silently
 				return
 			}
 			if !ok {
-				if err := c.ws.WriteMessage(websocket.CloseMessage, []byte{}); err != nil {
-					log.Printf("Failed to write close message: %v", err)
-				}
+				// Channel closed, try to send close message but ignore errors
+				_ = c.ws.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
@@ -281,7 +281,12 @@ func (c *Connection) handleRegister(msg *protocol.Message) {
 	}
 
 	if err := c.server.database.CreateUser(user); err != nil {
-		logging.ErrorWithError("Failed to create user in database", err, map[string]string{"username": req.Username})
+		// Check if it's a duplicate user error (expected behavior)
+		if strings.Contains(err.Error(), "already exists") {
+			logging.Warn("User registration rejected - username already exists", map[string]string{"username": req.Username})
+		} else {
+			logging.ErrorWithError("Failed to create user in database", err, map[string]string{"username": req.Username})
+		}
 		c.sendError(409, fmt.Sprintf("Registration failed: %v", err))
 		return
 	}
