@@ -29,6 +29,7 @@ type Connection struct {
 	authenticated bool
 	readBuffer    []byte     // Reusable read buffer
 	mu            sync.Mutex // Protects connection state
+	closeOnce     sync.Once  // Ensures send channel is closed only once
 }
 
 // Server manages WebSocket connections and message routing
@@ -70,18 +71,55 @@ func NewServer(dbPath string) (*Server, error) {
 	return server, nil
 }
 
+// Safe helper methods for Connection state access
+func (c *Connection) getUsername() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.username
+}
+
+func (c *Connection) setUsername(username string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.username = username
+}
+
+func (c *Connection) isAuthenticated() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.authenticated
+}
+
+func (c *Connection) setAuthenticated(auth bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.authenticated = auth
+}
+
+func (c *Connection) safeClose() {
+	c.closeOnce.Do(func() {
+		close(c.send)
+	})
+}
+
 // Run starts the server hub
 func (s *Server) Run() {
 	for {
 		select {
 		case conn := <-s.register:
-			s.connections.Store(conn.username, conn)
-			logging.Info("User connected", map[string]string{"username": conn.username})
+			username := conn.getUsername()
+			if username != "" {
+				s.connections.Store(username, conn)
+				logging.Info("User connected", map[string]string{"username": username})
+			}
 
 		case conn := <-s.unregister:
-			if _, ok := s.connections.LoadAndDelete(conn.username); ok {
-				close(conn.send)
-				logging.Info("User disconnected", map[string]string{"username": conn.username})
+			username := conn.getUsername()
+			if username != "" {
+				if _, ok := s.connections.LoadAndDelete(username); ok {
+					conn.safeClose()
+					logging.Info("User disconnected", map[string]string{"username": username})
+				}
 			}
 
 		case message := <-s.broadcast:
@@ -91,7 +129,7 @@ func (s *Server) Run() {
 				case conn.send <- message:
 				default:
 					s.connections.Delete(key)
-					close(conn.send)
+					conn.safeClose()
 				}
 				return true
 			})
@@ -128,7 +166,8 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 // readPump handles incoming messages from the WebSocket
 func (c *Connection) readPump() {
 	defer func() {
-		if c.username != "" {
+		username := c.getUsername()
+		if username != "" {
 			c.server.unregister <- c
 		}
 		c.ws.Close()
@@ -298,12 +337,13 @@ func (c *Connection) handleRegister(msg *protocol.Message) {
 
 // handleSend processes message sending
 func (c *Connection) handleSend(msg *protocol.Message) {
-	c.mu.Lock()
-	isAuthenticated := c.authenticated
-	username := c.username
-	c.mu.Unlock()
+	if !c.isAuthenticated() {
+		c.sendError(401, "Not authenticated")
+		return
+	}
 
-	if !isAuthenticated {
+	username := c.getUsername()
+	if username == "" {
 		c.sendError(401, "Not authenticated")
 		return
 	}
@@ -340,7 +380,11 @@ func (c *Connection) handleSend(msg *protocol.Message) {
 		return
 	}
 
-	targetConn := value.(*Connection)
+	targetConn, ok := value.(*Connection)
+	if !ok {
+		c.sendError(500, "Invalid connection state")
+		return
+	}
 
 	// Create message delivery with session info
 	delivery := protocol.OfflineMessage{
@@ -433,10 +477,8 @@ func (c *Connection) handleAuthenticate(msg *protocol.Message) {
 	}
 
 	// Authentication successful
-	c.mu.Lock()
-	c.username = req.Username
-	c.authenticated = true
-	c.mu.Unlock()
+	c.setUsername(req.Username)
+	c.setAuthenticated(true)
 
 	c.server.register <- c
 
@@ -453,12 +495,13 @@ func (c *Connection) handleAuthenticate(msg *protocol.Message) {
 
 // handleKeyExchange processes Diffie-Hellman key exchange for PFS
 func (c *Connection) handleKeyExchange(msg *protocol.Message) {
-	c.mu.Lock()
-	isAuthenticated := c.authenticated
-	username := c.username
-	c.mu.Unlock()
+	if !c.isAuthenticated() {
+		c.sendError(401, "Not authenticated")
+		return
+	}
 
-	if !isAuthenticated {
+	username := c.getUsername()
+	if username == "" {
 		c.sendError(401, "Not authenticated")
 		return
 	}
@@ -476,11 +519,15 @@ func (c *Connection) handleKeyExchange(msg *protocol.Message) {
 		return
 	}
 
-	targetConn := value.(*Connection)
+	targetConn, ok := value.(*Connection)
+	if !ok {
+		c.sendError(500, "Invalid connection state")
+		return
+	}
 
 	// Forward key exchange request
 	keyRequest := protocol.KeyExchangeRequest{
-		To:        req.To,
+		To:        username, // This should be the initiator's username
 		PublicKey: req.PublicKey,
 		SessionID: req.SessionID,
 	}
@@ -505,9 +552,10 @@ func (c *Connection) handleKeyExchange(msg *protocol.Message) {
 
 // deliverOfflineMessages delivers any stored offline messages to the user
 func (c *Connection) deliverOfflineMessages() {
-	c.mu.Lock()
-	username := c.username
-	c.mu.Unlock()
+	username := c.getUsername()
+	if username == "" {
+		return
+	}
 
 	messages, err := c.server.database.GetOfflineMessages(username)
 	if err != nil {
@@ -549,37 +597,34 @@ func (c *Connection) deliverOfflineMessages() {
 
 // handleListen acknowledges that the client is ready to receive messages
 func (c *Connection) handleListen(msg *protocol.Message) {
-	c.mu.Lock()
-	isAuthenticated := c.authenticated
-	username := c.username
-	c.mu.Unlock()
-
-	if !isAuthenticated {
+	if !c.isAuthenticated() {
 		c.sendError(401, "Not authenticated")
 		return
 	}
 
+	username := c.getUsername()
 	c.sendMessage(protocol.MsgTypeAck, map[string]string{"status": "listening"})
-	if err := c.server.database.UpdateLastSeen(username); err != nil {
-		log.Printf("Failed to update last seen for %s: %v", username, err)
+	if username != "" {
+		if err := c.server.database.UpdateLastSeen(username); err != nil {
+			log.Printf("Failed to update last seen for %s: %v", username, err)
+		}
 	}
 }
 
 // handleListUsers returns list of online users
 func (c *Connection) handleListUsers(msg *protocol.Message) {
-	c.mu.Lock()
-	isAuthenticated := c.authenticated
-	username := c.username
-	c.mu.Unlock()
-
-	if !isAuthenticated {
+	if !c.isAuthenticated() {
 		c.sendError(401, "Not authenticated")
 		return
 	}
 
+	username := c.getUsername()
 	var users []string
 	c.server.connections.Range(func(key, value interface{}) bool {
-		connUsername := key.(string)
+		connUsername, ok := key.(string)
+		if !ok {
+			return true // Skip invalid entries
+		}
 		if connUsername != username { // Don't include self
 			users = append(users, connUsername)
 		}
@@ -592,14 +637,12 @@ func (c *Connection) handleListUsers(msg *protocol.Message) {
 
 // handleHeartbeat processes heartbeat messages
 func (c *Connection) handleHeartbeat(msg *protocol.Message) {
-	c.mu.Lock()
-	isAuthenticated := c.authenticated
-	username := c.username
-	c.mu.Unlock()
-
-	if isAuthenticated && username != "" {
-		if err := c.server.database.UpdateLastSeen(username); err != nil {
-			log.Printf("Failed to update last seen for %s: %v", username, err)
+	if c.isAuthenticated() {
+		username := c.getUsername()
+		if username != "" {
+			if err := c.server.database.UpdateLastSeen(username); err != nil {
+				log.Printf("Failed to update last seen for %s: %v", username, err)
+			}
 		}
 	}
 	c.sendMessage(protocol.MsgTypeAck, map[string]string{"status": "ok"})
@@ -616,12 +659,19 @@ func (c *Connection) sendMessage(msgType protocol.MessageType, data interface{})
 		return
 	}
 
+	// Use a defer-recover to handle potential panics from closed channels
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic in sendMessage: %v", r)
+		}
+	}()
+
 	select {
 	case c.send <- msgBytes:
+		// Message sent successfully
 	default:
-		// Channel is full, connection is likely dead - don't close here
-		// Let the unregister process handle cleanup
-		log.Printf("Failed to send message: channel full")
+		// Channel is full or closed, connection is likely dead
+		log.Printf("Failed to send message: channel full or closed")
 	}
 }
 

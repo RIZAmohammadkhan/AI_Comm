@@ -27,8 +27,8 @@ type Client struct {
 	configDir          string
 	username           string
 	userCrypto         *crypto.UserCrypto
-	isListening        int32 // atomic flag
-	authenticated      bool
+	isListening        int32                               // atomic flag
+	authenticated      int32                               // atomic flag for thread safety
 	sessionKeys        map[string]*crypto.SessionKeys      // Protected by mu
 	recipientSessions  map[string]string                   // Protected by mu
 	pendingKeyExchange map[string]*crypto.DHKeyPair        // Protected by mu
@@ -37,6 +37,7 @@ type Client struct {
 	writeBuffer        []byte                              // Reusable write buffer
 	mu                 sync.RWMutex                        // Protects maps above
 	writeMu            sync.Mutex                          // Protects WebSocket writes
+	closeOnce          sync.Once                           // Ensures cleanup happens only once
 }
 
 // UserConfig stores user credentials locally
@@ -50,6 +51,11 @@ type UserConfig struct {
 func NewClient(serverURL string) *Client {
 	homeDir, _ := os.UserHomeDir()
 	configDir := filepath.Join(homeDir, ".aimessage")
+	return NewClientWithConfigDir(serverURL, configDir)
+}
+
+// NewClientWithConfigDir creates a new client instance with a custom config directory
+func NewClientWithConfigDir(serverURL, configDir string) *Client {
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		log.Printf("Warning: failed to create config directory: %v", err)
 	}
@@ -64,6 +70,47 @@ func NewClient(serverURL string) *Client {
 		readBuffer:         make([]byte, 0, 512), // Pre-allocate read buffer
 		writeBuffer:        make([]byte, 0, 512), // Pre-allocate write buffer
 	}
+}
+
+// cleanupKeyExchange safely cleans up key exchange state
+func (c *Client) cleanupKeyExchange(sessionID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Close waiter channel if exists
+	if waiterChan, exists := c.keyExchangeWaiters[sessionID]; exists {
+		close(waiterChan)
+		delete(c.keyExchangeWaiters, sessionID)
+	}
+
+	// Clean up pending exchange
+	delete(c.pendingKeyExchange, sessionID)
+}
+
+// safeCleanup ensures all resources are cleaned up safely
+func (c *Client) safeCleanup() {
+	c.closeOnce.Do(func() {
+		// Stop listening
+		atomic.StoreInt32(&c.isListening, 0)
+		atomic.StoreInt32(&c.authenticated, 0)
+
+		// Clean up all key exchange waiters
+		c.mu.Lock()
+		for sessionID, waiterChan := range c.keyExchangeWaiters {
+			close(waiterChan)
+			delete(c.keyExchangeWaiters, sessionID)
+		}
+		// Clear all maps
+		clear(c.pendingKeyExchange)
+		clear(c.sessionKeys)
+		clear(c.recipientSessions)
+		c.mu.Unlock()
+
+		// Close WebSocket connection
+		if c.conn != nil {
+			c.conn.Close()
+		}
+	})
 }
 
 // Connect establishes WebSocket connection to the server
@@ -88,6 +135,11 @@ func (c *Client) Disconnect() error {
 		return c.conn.Close()
 	}
 	return nil
+}
+
+// Close performs complete cleanup of the client
+func (c *Client) Close() {
+	c.safeCleanup()
 }
 
 // Register registers a new user with the server
@@ -179,9 +231,7 @@ func (c *Client) initiateKeyExchange(recipient string) (string, error) {
 	msg.ID = uuid.New().String()
 
 	if err := c.sendMessage(msg); err != nil {
-		c.mu.Lock()
-		delete(c.pendingKeyExchange, sessionID)
-		c.mu.Unlock()
+		c.cleanupKeyExchange(sessionID)
 		return "", fmt.Errorf("failed to send key exchange request: %w", err)
 	}
 
@@ -218,10 +268,7 @@ func (c *Client) getOrCreateSession(recipient string) (string, *crypto.SessionKe
 
 	select {
 	case <-timeout:
-		c.mu.Lock()
-		delete(c.pendingKeyExchange, sessionID)
-		delete(c.keyExchangeWaiters, sessionID)
-		c.mu.Unlock()
+		c.cleanupKeyExchange(sessionID)
 		return "", nil, fmt.Errorf("key exchange timeout for session %s", sessionID)
 	case sessionKeys := <-waiterChan:
 		c.mu.Lock()
@@ -374,7 +421,7 @@ func (c *Client) sendMessageFallback(to, message string) error {
 
 // authenticate performs challenge-response authentication
 func (c *Client) authenticate() error {
-	if c.authenticated {
+	if atomic.LoadInt32(&c.authenticated) == 1 {
 		return nil
 	}
 
@@ -448,7 +495,7 @@ func (c *Client) authenticate() error {
 	}
 
 	if response.Type == protocol.MsgTypeAck {
-		c.authenticated = true
+		atomic.StoreInt32(&c.authenticated, 1)
 		fmt.Printf("Authentication successful for %s\n", c.username)
 		return nil
 	}
@@ -644,7 +691,7 @@ func (c *Client) handleKeyExchangeRequest(response *protocol.Message) {
 		return
 	}
 
-	// 5. Store session keys
+	// 5. Store session keys (with proper locking)
 	c.mu.Lock()
 	c.sessionKeys[keyReq.SessionID] = sessionKeys
 	// Note: keyReq.To is actually the sender (initiator)
@@ -699,9 +746,7 @@ func (c *Client) handleKeyExchangeResponse(response *protocol.Message) {
 	theirPublicKey, err := base64.StdEncoding.DecodeString(keyResp.PublicKey)
 	if err != nil {
 		log.Printf("Failed to decode their public key: %v", err)
-		c.mu.Lock()
-		delete(c.pendingKeyExchange, keyResp.SessionID)
-		c.mu.Unlock()
+		c.cleanupKeyExchange(keyResp.SessionID)
 		return
 	}
 
@@ -709,9 +754,7 @@ func (c *Client) handleKeyExchangeResponse(response *protocol.Message) {
 	sharedSecret, err := crypto.ComputeSharedSecret(ourKeyPair.PrivateKey, theirPublicKey)
 	if err != nil {
 		log.Printf("Failed to compute shared secret: %v", err)
-		c.mu.Lock()
-		delete(c.pendingKeyExchange, keyResp.SessionID)
-		c.mu.Unlock()
+		c.cleanupKeyExchange(keyResp.SessionID)
 		return
 	}
 
@@ -719,18 +762,14 @@ func (c *Client) handleKeyExchangeResponse(response *protocol.Message) {
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
 		log.Printf("Failed to generate salt: %v", err)
-		c.mu.Lock()
-		delete(c.pendingKeyExchange, keyResp.SessionID)
-		c.mu.Unlock()
+		c.cleanupKeyExchange(keyResp.SessionID)
 		return
 	}
 
 	sessionKeys, err := crypto.DeriveSessionKeys(sharedSecret, keyResp.SessionID, salt)
 	if err != nil {
 		log.Printf("Failed to derive session keys: %v", err)
-		c.mu.Lock()
-		delete(c.pendingKeyExchange, keyResp.SessionID)
-		c.mu.Unlock()
+		c.cleanupKeyExchange(keyResp.SessionID)
 		return
 	}
 
