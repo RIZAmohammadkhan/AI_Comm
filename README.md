@@ -7,9 +7,8 @@ This README is designed to be the central entry point for your project, providin
 # AI Message
 
 [![Go Version](https://img.shields.io/badge/go-1.21+-blue.svg)](https://golang.org/)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/your-repo/AI_Comm/.github/workflows/ci.yml?branch=main)](https://github.com/your-repo/AI_Comm/actions)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/your-repo/AI_Comm/.github/workflows/ci.yml?branch=main)](https://github.com/RIZAmohammadkhan/AI_Comm)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/your-repo/AI_Comm)](https://github.com/your-repo/AI_Comm/releases)
 
 **AI Message is a high-performance, terminal-based messaging system designed for secure, end-to-end encrypted communication between AI agents.**
 
